@@ -9,7 +9,7 @@ use bollard::query_parameters::{
 };
 use crate::docker::{ContainerManager, DestroyOptions};
 use chrono::DateTime;
-use futures::StreamExt;
+use futures::{StreamExt, future::join_all};
 use std::path::Path;
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
@@ -26,7 +26,13 @@ pub(crate) enum GatewayControlCommand {
     ExecList,
     ExecStop,
     ExecPause,
-    ExecStats { current: bool },
+    ExecStats { current: bool, watch: bool },
+}
+
+#[derive(Debug)]
+pub(crate) enum GatewayControlExecution {
+    Immediate { exit_status: u32, output: String },
+    WatchStats { current: bool, interval: Duration },
 }
 
 pub(crate) fn parse_gateway_control_command(cmd: &str) -> Option<GatewayControlCommand> {
@@ -62,14 +68,16 @@ pub(crate) fn parse_gateway_control_command(cmd: &str) -> Option<GatewayControlC
         }
         "stats" => {
             let mut current = false;
+            let mut watch = false;
             for arg in it {
                 match arg {
                     "--current" | "--curennt" => current = true,
+                    "--watch" | "-w" => watch = true,
                     "--help" | "-h" => return Some(GatewayControlCommand::Help),
                     _ => return Some(GatewayControlCommand::Help),
                 }
             }
-            Some(GatewayControlCommand::ExecStats { current })
+            Some(GatewayControlCommand::ExecStats { current, watch })
         }
         "exec" => {
             let action = it.next().unwrap_or("help");
@@ -98,14 +106,16 @@ pub(crate) fn parse_gateway_control_command(cmd: &str) -> Option<GatewayControlC
                 }
                 "stats" => {
                     let mut current = false;
+                    let mut watch = false;
                     for arg in it {
                         match arg {
                             "--current" | "--curennt" => current = true,
+                            "--watch" | "-w" => watch = true,
                             "--help" | "-h" => return Some(GatewayControlCommand::Help),
                             _ => return Some(GatewayControlCommand::Help),
                         }
                     }
-                    Some(GatewayControlCommand::ExecStats { current })
+                    Some(GatewayControlCommand::ExecStats { current, watch })
                 }
                 _ => Some(GatewayControlCommand::Help),
             }
@@ -151,7 +161,7 @@ Usage:
   agentman list
   agentman stop
   agentman pause
-  agentman stats [--current]
+  agentman stats [--current] [--watch]
 
 Notes:
   - Without --yes, destroy refuses to delete your persistent workspace directory.
@@ -159,6 +169,7 @@ Notes:
   - --dry-run prints what would be deleted.
   - stop/pause apply to the *current* sandbox (the project in your SSH user).
   - stats without --current shows all sandboxes for your GitHub user.
+  - --watch refreshes output every second (use Ctrl-C to exit).
   - `agentman exec <cmd>` is accepted as an alias for these commands.
 "
     .to_string()
@@ -169,9 +180,12 @@ pub(crate) async fn execute_gateway_control_command(
     container_manager: &ContainerManager,
     github_user: &str,
     project: &str,
-) -> (u32, String) {
+) -> GatewayControlExecution {
     match ctrl {
-        GatewayControlCommand::Help => (0u32, gateway_control_help_text()),
+        GatewayControlCommand::Help => GatewayControlExecution::Immediate {
+            exit_status: 0u32,
+            output: gateway_control_help_text(),
+        },
         GatewayControlCommand::Destroy {
             yes,
             keep_workspace,
@@ -179,7 +193,10 @@ pub(crate) async fn execute_gateway_control_command(
             force,
         } => {
             if !dry_run && !keep_workspace && !yes {
-                (2u32, destroy_confirmation_required_text())
+                GatewayControlExecution::Immediate {
+                    exit_status: 2u32,
+                    output: destroy_confirmation_required_text(),
+                }
             } else {
                 let opts = DestroyOptions {
                     keep_workspace,
@@ -191,8 +208,14 @@ pub(crate) async fn execute_gateway_control_command(
                     .destroy_workspace(github_user, project, opts)
                     .await
                 {
-                    Ok(res) => (0u32, res.format_human()),
-                    Err(e) => (1u32, format!("Destroy failed: {e}\n")),
+                    Ok(res) => GatewayControlExecution::Immediate {
+                        exit_status: 0u32,
+                        output: res.format_human(),
+                    },
+                    Err(e) => GatewayControlExecution::Immediate {
+                        exit_status: 1u32,
+                        output: format!("Destroy failed: {e}\n"),
+                    },
                 }
             }
         }
@@ -201,7 +224,10 @@ pub(crate) async fn execute_gateway_control_command(
             workspaces.sort_by(|a, b| a.project.cmp(&b.project));
 
             if workspaces.is_empty() {
-                return (0u32, format!("agentman: no sandboxes for {github_user}\n"));
+                return GatewayControlExecution::Immediate {
+                    exit_status: 0u32,
+                    output: format!("agentman: no sandboxes for {github_user}\n"),
+                };
             }
 
             let mut out = format!("agentman: sandboxes for {github_user}\n");
@@ -223,209 +249,299 @@ pub(crate) async fn execute_gateway_control_command(
                     id_suffix
                 ));
             }
-            (0u32, out)
+            GatewayControlExecution::Immediate {
+                exit_status: 0u32,
+                output: out,
+            }
         }
         GatewayControlCommand::ExecStop => match container_manager.get_workspace(github_user, project).await {
-            None => (
-                1u32,
-                format!("agentman: no sandbox found for {github_user}/{project}\n"),
-            ),
+            None => GatewayControlExecution::Immediate {
+                exit_status: 1u32,
+                output: format!("agentman: no sandbox found for {github_user}/{project}\n"),
+            },
             Some(ws) => {
                 let docker = container_manager.docker();
-                let info = match docker
+                let (exit_status, output) = match docker
                     .inspect_container(&ws.container_name, None::<InspectContainerOptions>)
                     .await
                 {
-                    Ok(info) => info,
-                    Err(BollardError::DockerResponseServerError {
-                        status_code: 404, ..
-                    }) => {
-                        return (
-                            1u32,
-                            format!(
-                                "agentman: container not found for {github_user}/{project} (expected name {})\n",
-                                ws.container_name
-                            ),
-                        );
+                    Ok(info) => {
+                        let running = info
+                            .state
+                            .as_ref()
+                            .and_then(|s| s.running)
+                            .unwrap_or(false);
+
+                        if !running {
+                            (0u32, format!("agentman: sandbox {project} is already stopped\n"))
+                        } else {
+                            match docker
+                                .stop_container(
+                                    &ws.container_name,
+                                    Some(StopContainerOptionsBuilder::new().t(10).build()),
+                                )
+                                .await
+                            {
+                                Ok(_) => (
+                                    0u32,
+                                    format!(
+                                        "agentman: stopped sandbox {project} ({})\n",
+                                        ws.container_name
+                                    ),
+                                ),
+                                Err(BollardError::DockerResponseServerError {
+                                    status_code: 404, ..
+                                }) => (
+                                    1u32,
+                                    format!("agentman: container not found: {}\n", ws.container_name),
+                                ),
+                                Err(e) => (1u32, format!("agentman: stop failed: {e}\n")),
+                            }
+                        }
                     }
-                    Err(e) => {
-                        return (
-                            1u32,
-                            format!("agentman: failed to inspect container {}: {e}\n", ws.container_name),
-                        );
-                    }
-                };
-
-                let running = info
-                    .state
-                    .as_ref()
-                    .and_then(|s| s.running)
-                    .unwrap_or(false);
-
-                if !running {
-                    return (
-                        0u32,
-                        format!("agentman: sandbox {project} is already stopped\n"),
-                    );
-                }
-
-                match docker
-                    .stop_container(
-                        &ws.container_name,
-                        Some(StopContainerOptionsBuilder::new().t(10).build()),
-                    )
-                    .await
-                {
-                    Ok(_) => (
-                        0u32,
-                        format!("agentman: stopped sandbox {project} ({})\n", ws.container_name),
-                    ),
                     Err(BollardError::DockerResponseServerError {
                         status_code: 404, ..
                     }) => (
                         1u32,
-                        format!("agentman: container not found: {}\n", ws.container_name),
+                        format!(
+                            "agentman: container not found for {github_user}/{project} (expected name {})\n",
+                            ws.container_name
+                        ),
                     ),
-                    Err(e) => (1u32, format!("agentman: stop failed: {e}\n")),
-                }
+                    Err(e) => (
+                        1u32,
+                        format!("agentman: failed to inspect container {}: {e}\n", ws.container_name),
+                    ),
+                };
+
+                GatewayControlExecution::Immediate { exit_status, output }
             }
         },
         GatewayControlCommand::ExecPause => match container_manager.get_workspace(github_user, project).await {
-            None => (
-                1u32,
-                format!("agentman: no sandbox found for {github_user}/{project}\n"),
-            ),
+            None => GatewayControlExecution::Immediate {
+                exit_status: 1u32,
+                output: format!("agentman: no sandbox found for {github_user}/{project}\n"),
+            },
             Some(ws) => {
                 let docker = container_manager.docker();
-                let info = match docker
+                let (exit_status, output) = match docker
                     .inspect_container(&ws.container_name, None::<InspectContainerOptions>)
                     .await
                 {
-                    Ok(info) => info,
-                    Err(BollardError::DockerResponseServerError {
-                        status_code: 404, ..
-                    }) => {
-                        return (
-                            1u32,
-                            format!(
-                                "agentman: container not found for {github_user}/{project} (expected name {})\n",
-                                ws.container_name
-                            ),
-                        );
+                    Ok(info) => {
+                        let running = info
+                            .state
+                            .as_ref()
+                            .and_then(|s| s.running)
+                            .unwrap_or(false);
+                        let paused = info
+                            .state
+                            .as_ref()
+                            .and_then(|s| s.paused)
+                            .unwrap_or(false);
+
+                        if !running {
+                            (
+                                1u32,
+                                format!("agentman: sandbox {project} is not running (cannot pause)\n"),
+                            )
+                        } else if paused {
+                            (0u32, format!("agentman: sandbox {project} is already paused\n"))
+                        } else {
+                            match docker.pause_container(&ws.container_name).await {
+                                Ok(_) => (
+                                    0u32,
+                                    format!(
+                                        "agentman: paused sandbox {project} ({})\n",
+                                        ws.container_name
+                                    ),
+                                ),
+                                Err(BollardError::DockerResponseServerError {
+                                    status_code: 404, ..
+                                }) => (
+                                    1u32,
+                                    format!("agentman: container not found: {}\n", ws.container_name),
+                                ),
+                                Err(e) => (1u32, format!("agentman: pause failed: {e}\n")),
+                            }
+                        }
                     }
-                    Err(e) => {
-                        return (
-                            1u32,
-                            format!("agentman: failed to inspect container {}: {e}\n", ws.container_name),
-                        );
-                    }
-                };
-
-                let running = info
-                    .state
-                    .as_ref()
-                    .and_then(|s| s.running)
-                    .unwrap_or(false);
-                let paused = info
-                    .state
-                    .as_ref()
-                    .and_then(|s| s.paused)
-                    .unwrap_or(false);
-
-                if !running {
-                    return (
-                        1u32,
-                        format!("agentman: sandbox {project} is not running (cannot pause)\n"),
-                    );
-                }
-                if paused {
-                    return (
-                        0u32,
-                        format!("agentman: sandbox {project} is already paused\n"),
-                    );
-                }
-
-                match docker.pause_container(&ws.container_name).await {
-                    Ok(_) => (
-                        0u32,
-                        format!("agentman: paused sandbox {project} ({})\n", ws.container_name),
-                    ),
                     Err(BollardError::DockerResponseServerError {
                         status_code: 404, ..
                     }) => (
                         1u32,
-                        format!("agentman: container not found: {}\n", ws.container_name),
+                        format!(
+                            "agentman: container not found for {github_user}/{project} (expected name {})\n",
+                            ws.container_name
+                        ),
                     ),
-                    Err(e) => (1u32, format!("agentman: pause failed: {e}\n")),
-                }
+                    Err(e) => (
+                        1u32,
+                        format!("agentman: failed to inspect container {}: {e}\n", ws.container_name),
+                    ),
+                };
+
+                GatewayControlExecution::Immediate { exit_status, output }
             }
         },
-        GatewayControlCommand::ExecStats { current } => {
-            let mut workspaces = if current {
-                match container_manager.get_workspace(github_user, project).await {
-                    Some(ws) => vec![ws],
-                    None => {
-                        return (
-                            1u32,
-                            format!("agentman: no current sandbox found for {github_user}/{project}\n"),
-                        );
-                    }
+        GatewayControlCommand::ExecStats { current, watch } => {
+            if watch {
+                GatewayControlExecution::WatchStats {
+                    current,
+                    interval: Duration::from_secs(1),
                 }
             } else {
-                container_manager.list_workspaces(github_user).await
-            };
-            workspaces.sort_by(|a, b| a.project.cmp(&b.project));
-
-            if workspaces.is_empty() {
-                return (0u32, format!("agentman: no sandboxes for {github_user}\n"));
+                let (exit_status, output) =
+                    render_sandbox_stats(container_manager, github_user, project, current).await;
+                GatewayControlExecution::Immediate { exit_status, output }
             }
+        }
+    }
+}
 
-            let mut out = format!("agentman: sandbox stats for {github_user}\n");
-            for ws in workspaces {
-                let is_current = ws.project == project;
+pub(crate) async fn render_sandbox_stats(
+    container_manager: &ContainerManager,
+    github_user: &str,
+    project: &str,
+    current: bool,
+) -> (u32, String) {
+    let mut workspaces = if current {
+        match container_manager.get_workspace(github_user, project).await {
+            Some(ws) => vec![ws],
+            None => {
+                return (
+                    1u32,
+                    format!("agentman: no current sandbox found for {github_user}/{project}\n"),
+                );
+            }
+        }
+    } else {
+        container_manager.list_workspaces(github_user).await
+    };
+    workspaces.sort_by(|a, b| a.project.cmp(&b.project));
+
+    if workspaces.is_empty() {
+        return (0u32, format!("agentman: no sandboxes for {github_user}\n"));
+    }
+
+    let mut out = format!("agentman: sandbox stats for {github_user}\n");
+    for ws in workspaces {
+        let is_current = ws.project == project;
+        let (status, id_short, running) =
+            workspace_container_status_with_running(container_manager, &ws.container_name).await;
+
+        let (cpu, mem) = if running {
+            match container_stats_line(container_manager, &ws.container_name).await {
+                Some((cpu, mem)) => (Some(cpu), mem),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+
+        let storage = du_bytes(&ws.host_workspace_path).await;
+
+        out.push_str(&format!(
+            "- {}{}: status={}{}{}{} storage(workspace)={}\n",
+            ws.project,
+            if is_current { " (current)" } else { "" },
+            status,
+            if let Some(id) = id_short.as_deref() {
+                format!(" id={id}")
+            } else {
+                "".to_string()
+            },
+            if let Some(cpu) = cpu {
+                format!(" cpu={:.1}%", cpu)
+            } else {
+                " cpu=n/a".to_string()
+            },
+            if let Some((usage, limit)) = mem {
+                format!(" mem={}/{}", format_bytes(usage), format_bytes(limit))
+            } else {
+                " mem=n/a".to_string()
+            },
+            storage
+                .map(format_bytes)
+                .unwrap_or_else(|| "n/a".to_string())
+        ));
+    }
+    (0u32, out)
+}
+
+/// Fast version for watch mode: skips storage (du) and parallelizes stats queries.
+pub(crate) async fn render_sandbox_stats_fast(
+    container_manager: &ContainerManager,
+    github_user: &str,
+    project: &str,
+    current: bool,
+) -> (u32, String) {
+    let mut workspaces = if current {
+        match container_manager.get_workspace(github_user, project).await {
+            Some(ws) => vec![ws],
+            None => {
+                return (
+                    1u32,
+                    format!("agentman: no current sandbox found for {github_user}/{project}\n"),
+                );
+            }
+        }
+    } else {
+        container_manager.list_workspaces(github_user).await
+    };
+    workspaces.sort_by(|a, b| a.project.cmp(&b.project));
+
+    if workspaces.is_empty() {
+        return (0u32, format!("agentman: no sandboxes for {github_user}\n"));
+    }
+
+    // Parallelize: gather status + stats for all workspaces at once.
+    let futs: Vec<_> = workspaces
+        .iter()
+        .map(|ws| {
+            let container_name = ws.container_name.clone();
+            let cm = container_manager;
+            async move {
                 let (status, id_short, running) =
-                    workspace_container_status_with_running(container_manager, &ws.container_name)
-                        .await;
-
+                    workspace_container_status_with_running(cm, &container_name).await;
                 let (cpu, mem) = if running {
-                    match container_stats_line(container_manager, &ws.container_name).await {
-                        Some((cpu, mem)) => (Some(cpu), mem),
-                        None => (None, None),
-                    }
+                    container_stats_line_fast(cm, &container_name).await.unwrap_or((None, None))
                 } else {
                     (None, None)
                 };
-
-                let storage = du_bytes(&ws.host_workspace_path).await;
-
-                out.push_str(&format!(
-                    "- {}{}: status={}{}{}{} storage(workspace)={}\n",
-                    ws.project,
-                    if is_current { " (current)" } else { "" },
-                    status,
-                    if let Some(id) = id_short.as_deref() {
-                        format!(" id={id}")
-                    } else {
-                        "".to_string()
-                    },
-                    if let Some(cpu) = cpu {
-                        format!(" cpu={:.1}%", cpu)
-                    } else {
-                        " cpu=n/a".to_string()
-                    },
-                    if let Some((usage, limit)) = mem {
-                        format!(" mem={}/{}", format_bytes(usage), format_bytes(limit))
-                    } else {
-                        " mem=n/a".to_string()
-                    },
-                    storage
-                        .map(format_bytes)
-                        .unwrap_or_else(|| "n/a".to_string())
-                ));
+                (status, id_short, cpu, mem)
             }
-            (0u32, out)
-        }
+        })
+        .collect();
+
+    let results = join_all(futs).await;
+
+    let mut out = format!("agentman: sandbox stats for {github_user}\n");
+    for (ws, (status, id_short, cpu, mem)) in workspaces.iter().zip(results.into_iter()) {
+        let is_current = ws.project == project;
+        out.push_str(&format!(
+            "- {}{}: status={}{}{}{}\n",
+            ws.project,
+            if is_current { " (current)" } else { "" },
+            status,
+            if let Some(id) = id_short.as_deref() {
+                format!(" id={id}")
+            } else {
+                "".to_string()
+            },
+            if let Some(cpu) = cpu {
+                format!(" cpu={:.1}%", cpu)
+            } else {
+                " cpu=n/a".to_string()
+            },
+            if let Some((usage, limit)) = mem {
+                format!(" mem={}/{}", format_bytes(usage), format_bytes(limit))
+            } else {
+                " mem=n/a".to_string()
+            },
+        ));
     }
+    (0u32, out)
 }
 
 fn destroy_confirmation_required_text() -> String {
@@ -557,6 +673,59 @@ async fn container_stats_line(
     });
 
     Some((cpu_percent, mem))
+}
+
+/// Fast version for watch mode: uses one_shot for quicker response.
+/// CPU% may be less accurate but memory is reliable.
+async fn container_stats_line_fast(
+    container_manager: &ContainerManager,
+    container_name: &str,
+) -> Option<(Option<f64>, Option<(u64, u64)>)> {
+    let docker = container_manager.docker();
+    let mut stream = docker.stats(
+        container_name,
+        // one_shot gives a quick single sample (precpu_stats may be empty).
+        Some(StatsOptionsBuilder::new().stream(false).one_shot(true).build()),
+    );
+
+    let next = timeout(Duration::from_millis(1500), stream.next()).await.ok()??;
+    let stats = next.ok()?;
+
+    // Memory is always reliable.
+    let mem = stats.memory_stats.as_ref().and_then(|m| match (m.usage, m.limit) {
+        (Some(u), Some(l)) if l > 0 => Some((u, l)),
+        _ => None,
+    });
+
+    // CPU with one_shot: precpu_stats may be empty, so we try but may return None.
+    let cpu = (|| {
+        let cpu_stats = stats.cpu_stats.as_ref()?;
+        let precpu_stats = stats.precpu_stats.as_ref()?;
+        let cpu_usage = cpu_stats.cpu_usage.as_ref()?;
+        let precpu_usage = precpu_stats.cpu_usage.as_ref()?;
+
+        let cpu_total = cpu_usage.total_usage.unwrap_or(0);
+        let cpu_total_pre = precpu_usage.total_usage.unwrap_or(0);
+        if cpu_total == 0 || cpu_total_pre == 0 || cpu_total <= cpu_total_pre {
+            return None;
+        }
+
+        let system = cpu_stats.system_cpu_usage.unwrap_or(0);
+        let system_pre = precpu_stats.system_cpu_usage.unwrap_or(0);
+        let cpu_delta = cpu_total.saturating_sub(cpu_total_pre);
+        let system_delta = system.saturating_sub(system_pre);
+
+        let percpu_count = cpu_usage.percpu_usage.as_ref().map(|v| v.len() as u64).unwrap_or(1);
+        let online_cpus = cpu_stats.online_cpus.map(|n| n as u64).filter(|&n| n > 0).unwrap_or(percpu_count.max(1));
+
+        if system_delta > 0 {
+            Some((cpu_delta as f64 / system_delta as f64) * online_cpus as f64 * 100.0)
+        } else {
+            None
+        }
+    })();
+
+    Some((cpu, mem))
 }
 
 async fn du_bytes(path: &Path) -> Option<u64> {

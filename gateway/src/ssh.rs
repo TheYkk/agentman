@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -25,7 +26,10 @@ use tracing::{debug, info, warn};
 
 use crate::config::{GatewayConfig, ShellMode};
 use crate::docker::ContainerManager;
-use crate::gateway_control::{execute_gateway_control_command, parse_gateway_control_command};
+use crate::gateway_control::{
+    execute_gateway_control_command, parse_gateway_control_command, render_sandbox_stats_fast,
+    GatewayControlExecution,
+};
 use crate::github::{
     compute_fingerprint_from_pubkey, parse_ssh_username, public_key_to_openssh,
     validate_github_username, validate_project_name, GitHubKeyFetcher,
@@ -59,6 +63,9 @@ pub struct ConnectionHandler {
 
     /// Active exec sessions (channel_id -> exec_id).
     exec_sessions: HashMap<ChannelId, ExecSession>,
+
+    /// Active gateway-control watch sessions (channel_id -> cancelled flag).
+    watch_sessions: HashMap<ChannelId, Arc<AtomicBool>>,
 
     /// Pending GitHub username for keyboard-interactive auth.
     pending_github_user: Option<String>,
@@ -118,6 +125,7 @@ impl ConnectionHandler {
             project: None,
             container_id: None,
             exec_sessions: HashMap::new(),
+            watch_sessions: HashMap::new(),
             pending_github_user: None,
             remote_forwards: HashMap::new(),
             offered_key_fingerprints: Vec::new(),
@@ -545,7 +553,7 @@ impl Handler for ConnectionHandler {
         // Gateway control commands (handled by the gateway itself, not inside the container).
         // This is intentionally a very small "control surface" to keep behavior predictable.
         if let Some(ctrl) = parse_gateway_control_command(command.trim()) {
-            let (exit_status, output) = execute_gateway_control_command(
+            let res = execute_gateway_control_command(
                 ctrl,
                 self.server.container_manager.as_ref(),
                 github_user,
@@ -555,17 +563,91 @@ impl Handler for ConnectionHandler {
 
             // Confirm the exec request was accepted (OpenSSH sets want-reply=true).
             session.channel_success(channel_id)?;
-
             let handle = session.handle();
-            if !output.is_empty() {
-                let _ = handle
-                    .data(channel_id, CryptoVec::from_slice(output.as_bytes()))
-                    .await;
+
+            match res {
+                GatewayControlExecution::Immediate { exit_status, output } => {
+                    if !output.is_empty() {
+                        let _ = handle
+                            .data(channel_id, CryptoVec::from_slice(output.as_bytes()))
+                            .await;
+                    }
+                    let _ = handle.exit_status_request(channel_id, exit_status).await;
+                    let _ = handle.eof(channel_id).await;
+                    let _ = handle.close(channel_id).await;
+                    return Ok(());
+                }
+                GatewayControlExecution::WatchStats { current, interval } => {
+                    let cm = self.server.container_manager.clone();
+                    let github_user = github_user.to_string();
+                    let project = project.to_string();
+
+                    let cancelled = Arc::new(AtomicBool::new(false));
+                    self.watch_sessions.insert(channel_id, cancelled.clone());
+
+                    tokio::spawn(async move {
+                        // Use alternate screen + hide cursor so we don't spam scrollback.
+                        // These escape codes are harmless if the terminal doesn't support them.
+                        // Enter alternate screen, home cursor, hide cursor.
+                        let _ = handle
+                            .data(
+                                channel_id,
+                                CryptoVec::from_slice(b"\x1b[?1049h\x1b[H\x1b[?25l"),
+                            )
+                            .await;
+
+                        let mut final_status: u32 = 0;
+                        loop {
+                            if cancelled.load(Ordering::Relaxed) {
+                                break;
+                            }
+
+                            let (status, out) =
+                                render_sandbox_stats_fast(cm.as_ref(), &github_user, &project, current)
+                                    .await;
+                            final_status = status;
+
+                            // Home cursor + clear to end-of-screen, then redraw in-place.
+                            // Use CRLF line endings for proper display without PTY.
+                            let mut payload = String::from("\x1b[H\x1b[J");
+                            payload.push_str(&format!(
+                                "Updated: {} (every {}s) — Ctrl-C to exit\r\n\r\n",
+                                Utc::now().to_rfc3339(),
+                                interval.as_secs().max(1)
+                            ));
+                            // Convert LF to CRLF for proper display in raw SSH mode.
+                            payload.push_str(&out.replace('\n', "\r\n"));
+
+                            if handle
+                                .data(channel_id, CryptoVec::from_slice(payload.as_bytes()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+
+                            // If stats render failed (e.g. current sandbox missing), exit instead
+                            // of spinning forever.
+                            if final_status != 0 {
+                                break;
+                            }
+
+                            tokio::time::sleep(interval).await;
+                        }
+
+                        // Restore cursor + exit alternate screen.
+                        let _ = handle
+                            .data(channel_id, CryptoVec::from_slice(b"\x1b[?25h\x1b[?1049l"))
+                            .await;
+
+                        let _ = handle.exit_status_request(channel_id, final_status).await;
+                        let _ = handle.eof(channel_id).await;
+                        let _ = handle.close(channel_id).await;
+                    });
+
+                    return Ok(());
+                }
             }
-            let _ = handle.exit_status_request(channel_id, exit_status).await;
-            let _ = handle.eof(channel_id).await;
-            let _ = handle.close(channel_id).await;
-            return Ok(());
         }
 
         // Get or create container
@@ -668,6 +750,14 @@ impl Handler for ConnectionHandler {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        // Allow Ctrl-C to stop `agentman stats --watch` when a PTY is allocated.
+        if let Some(cancelled) = self.watch_sessions.get(&channel_id) {
+            if data.iter().any(|&b| b == 0x03) {
+                cancelled.store(true, Ordering::Relaxed);
+            }
+            return Ok(());
+        }
+
         if let Some(exec_session) = self.exec_sessions.get(&channel_id) {
             if let Some(ref tx) = exec_session.stdin_tx {
                 let _ = tx.send(data.to_vec()).await;
@@ -684,6 +774,9 @@ impl Handler for ConnectionHandler {
     ) -> Result<(), Self::Error> {
         debug!("Channel closed: {:?}", channel_id);
         self.exec_sessions.remove(&channel_id);
+        if let Some(cancelled) = self.watch_sessions.remove(&channel_id) {
+            cancelled.store(true, Ordering::Relaxed);
+        }
         self.ptys.remove(&channel_id);
         Ok(())
     }
@@ -695,6 +788,9 @@ impl Handler for ConnectionHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         debug!("Channel EOF: {:?}", channel_id);
+        if let Some(cancelled) = self.watch_sessions.remove(&channel_id) {
+            cancelled.store(true, Ordering::Relaxed);
+        }
         // Drop the stdin sender to signal EOF to container
         if let Some(exec_session) = self.exec_sessions.get_mut(&channel_id) {
             exec_session.stdin_tx = None;

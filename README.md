@@ -263,6 +263,16 @@ Show stats only for the **current** sandbox:
 ssh myproject@gateway agentman stats --current
 ```
 
+Watch stats (refresh every second) for **all** your sandboxes:
+```bash
+ssh myproject@gateway agentman stats --watch
+```
+
+Watch stats only for the **current** sandbox:
+```bash
+ssh myproject@gateway agentman stats --current --watch
+```
+
 Note: `agentman exec <cmd>` is accepted as an alias (e.g. `agentman exec stats --current`).
 
 ---
