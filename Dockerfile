@@ -14,6 +14,8 @@ ARG GO_VERSION=1.25.5
 ARG BUN_VERSION=1.3.5
 ARG UV_VERSION=0.9.22
 ARG PYTHON_VERSION=3.13
+ARG SDKMAN_VERSION=5.20.0
+ARG JAVA_VERSION=21.0.9-tem
 ARG DUCKDB_VERSION=1.4.3
 ARG OPENCODE_VERSION=v1.1.7
 
@@ -65,6 +67,7 @@ RUN apt-get update \
       psmisc \
       procps \
       ripgrep \
+      tmux \
       fd-find \
       rsync \
       socat \
@@ -178,7 +181,9 @@ USER ${USERNAME}
 WORKDIR /workspace
 ENV HOME=/home/${USERNAME} \
     GOPATH=/home/${USERNAME}/go \
-    PATH=/home/${USERNAME}/.cargo/bin:/home/${USERNAME}/.local/bin:/home/${USERNAME}/go/bin:/usr/local/go/bin:/usr/local/bun/bin:${PATH}
+    SDKMAN_DIR=/home/${USERNAME}/.sdkman \
+    JAVA_HOME=/home/${USERNAME}/.sdkman/candidates/java/current \
+    PATH=/home/${USERNAME}/.cargo/bin:/home/${USERNAME}/.local/bin:/home/${USERNAME}/go/bin:/usr/local/go/bin:/usr/local/bun/bin:/home/${USERNAME}/.sdkman/candidates/java/current/bin:${PATH}
 
 # --- Rust via rustup (pinned rustup-init + pinned toolchain) ---
 RUN arch="$(dpkg --print-architecture)" \
@@ -191,8 +196,10 @@ RUN arch="$(dpkg --print-architecture)" \
  && chmod +x /tmp/rustup-init \
  && /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain "${RUST_TOOLCHAIN}" \
  && rm -f /tmp/rustup-init \
+ && rustup component add rust-analyzer \
  && rustc --version \
  && cargo --version \
+ && rust-analyzer --version \
  && rustup --version
 
 # --- Python via uv (pinned) ---
@@ -202,6 +209,46 @@ RUN uv python install "${PYTHON_VERSION}" --default \
  && python --version \
  && python3 --version \
  && uv python list
+
+# --- Java via SDKMAN (pinned) ---
+# Install SDKMAN CLI from a pinned GitHub release, then install a pinned Java distribution.
+RUN arch="$(dpkg --print-architecture)" \
+ && case "${arch}" in \
+      amd64) sdk_platform="linuxx64" ;; \
+      arm64) sdk_platform="linuxarm64" ;; \
+      *) echo "Unsupported dpkg architecture: ${arch}" >&2; exit 1 ;; \
+    esac \
+ && tmpdir="$(mktemp -d)" \
+ && curl -fsSL -o "${tmpdir}/sdkman.zip" "https://github.com/sdkman/sdkman-cli/releases/download/${SDKMAN_VERSION}/sdkman-cli-${SDKMAN_VERSION}.zip" \
+ && unzip -q "${tmpdir}/sdkman.zip" -d "${tmpdir}" \
+ && mkdir -p "${SDKMAN_DIR}" \
+ && cp -a "${tmpdir}/sdkman-${SDKMAN_VERSION}/." "${SDKMAN_DIR}/" \
+ && rm -rf "${tmpdir}" \
+ && mkdir -p "${SDKMAN_DIR}/etc" "${SDKMAN_DIR}/var" "${SDKMAN_DIR}/candidates" "${SDKMAN_DIR}/tmp" "${SDKMAN_DIR}/ext" \
+ && printf '%s\n' \
+      '# SDKMAN configuration' \
+      'sdkman_auto_answer=true' \
+      'sdkman_auto_complete=false' \
+      'sdkman_auto_env=false' \
+    >"${SDKMAN_DIR}/etc/config" \
+ && printf '%s' "${sdk_platform}" >"${SDKMAN_DIR}/var/platform" \
+ && printf '%s' 'java' >"${SDKMAN_DIR}/var/candidates" \
+ && export SDKMAN_CANDIDATES_API="https://api.sdkman.io/2" \
+ && export SDKMAN_BROKER_API="https://broker.sdkman.io" \
+ && set +u \
+ && source "${SDKMAN_DIR}/bin/sdkman-init.sh" \
+ && sdk version \
+ && sdk install java "${JAVA_VERSION}" \
+ && java -version \
+ && set -u
+
+# Some SDKMAN commands expect a version file at `${SDKMAN_DIR}/var/version`.
+RUN mkdir -p "${SDKMAN_DIR}/var" \
+ && printf '%s' "${SDKMAN_VERSION}" >"${SDKMAN_DIR}/var/version"
+
+# Ensure interactive shells have `sdk` available.
+RUN printf '\n# Agent toolchain paths\nexport GOPATH=\"$HOME/go\"\nexport PATH=\"$HOME/.cargo/bin:$HOME/.local/bin:$GOPATH/bin:/usr/local/go/bin:/usr/local/bun/bin:$PATH\"\n\n# SDKMAN\nexport SDKMAN_DIR=\"$HOME/.sdkman\"\n[[ -s \"$SDKMAN_DIR/bin/sdkman-init.sh\" ]] && source \"$SDKMAN_DIR/bin/sdkman-init.sh\"\n' \
+ | tee -a "${HOME}/.bashrc" "${HOME}/.profile" >/dev/null
 
 COPY AGENTS.md .
 
