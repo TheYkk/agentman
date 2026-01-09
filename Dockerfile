@@ -58,6 +58,7 @@ RUN apt-get update \
       # Common dev utilities
       htop \
       less \
+      linux-perf \
       lsof \
       nano \
       iproute2 \
@@ -269,7 +270,12 @@ COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/setup-ssh-keys.sh /usr/local/bin/docker-entrypoint.sh \
  && chown root:root /usr/local/bin/setup-ssh-keys.sh /usr/local/bin/docker-entrypoint.sh
 
-COPY AGENTS.md .
+# Create pre_workspace folder for files that should be copied to /workspace on container start
+RUN mkdir -p /pre_workspace \
+ && chown -R ${USERNAME}:${USERNAME} /pre_workspace
+COPY AGENTS.md /pre_workspace/
+RUN chown -R ${USERNAME}:${USERNAME} /pre_workspace
+
 USER ${USERNAME}
 
 # Set tini as entrypoint for proper signal handling.

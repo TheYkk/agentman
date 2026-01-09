@@ -3,6 +3,19 @@ set -euo pipefail
 
 # Entrypoint script that sets up SSH and runs the original command
 
+# Copy files from /pre_workspace to /workspace if they don't already exist
+if [ -d /pre_workspace ]; then
+    for file in /pre_workspace/*; do
+        if [ -f "$file" ]; then
+            filename=$(basename "$file")
+            if [ ! -f "/workspace/$filename" ]; then
+                cp "$file" "/workspace/$filename"
+                echo "Copied $filename to /workspace"
+            fi
+        fi
+    done
+fi
+
 # Setup SSH keys from GitHub if GITHUB_USERNAME is set
 if [ -n "${GITHUB_USERNAME:-}" ]; then
     /usr/local/bin/setup-ssh-keys.sh || {
