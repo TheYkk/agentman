@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use bollard::exec::StartExecResults;
+use bollard::container::LogOutput;
 use chrono::Utc;
 use futures::StreamExt;
 use russh::server::{Auth, Handler, Msg, Session};
@@ -961,13 +962,35 @@ impl ConnectionHandler {
                         while let Some(output_result) = output.next().await {
                             match output_result {
                                 Ok(output) => {
-                                    let data = output.into_bytes();
-                                    if handle
-                                        .data(channel_id, CryptoVec::from_slice(&data))
-                                        .await
-                                        .is_err()
-                                    {
-                                        break;
+                                    match output {
+                                        LogOutput::StdErr { message } => {
+                                            // Keep stderr separate so tools like Zed can use stdout as a clean transport.
+                                            if handle
+                                                .extended_data(
+                                                    channel_id,
+                                                    1, // SSH_EXTENDED_DATA_STDERR
+                                                    CryptoVec::from_slice(message.as_ref()),
+                                                )
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        LogOutput::StdOut { message }
+                                        | LogOutput::StdIn { message }
+                                        | LogOutput::Console { message } => {
+                                            if handle
+                                                .data(
+                                                    channel_id,
+                                                    CryptoVec::from_slice(message.as_ref()),
+                                                )
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
                                     }
                                 }
                                 Err(e) => {
