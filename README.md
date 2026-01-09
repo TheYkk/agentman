@@ -217,6 +217,25 @@ The workspace is bind-mounted to `/workspace` inside the container. This persist
 
 **Permissions note (important for Zed/VS Code Remote SSH):** the gateway bind-mounts a host directory into `/workspace`. The container runs as a non-root user (UID/GID **1000** by default), so the host workspace directory must be writable by that user. The gateway will attempt to `chown`/`chmod` the workspace directory automatically; if you run the gateway without permission to do that, fix it on the host (or set `workspace_root` to a location with correct ownership).
 
+### Destroying a Sandbox (Kill + Delete Persistent Workspace)
+
+The gateway supports a small set of **control commands** via SSH exec. This lets you stop/remove your sandbox container and optionally delete the persistent workspace directory on the host.
+
+Delete the container(s) **and** the persisted workspace data:
+```bash
+ssh myproject@gateway agentman destroy --yes
+```
+
+Stop/remove the container(s) but **keep** the persisted workspace data:
+```bash
+ssh myproject@gateway agentman destroy --keep-workspace
+```
+
+Preview what would be deleted:
+```bash
+ssh myproject@gateway agentman destroy --dry-run
+```
+
 ---
 
 ## Base Image

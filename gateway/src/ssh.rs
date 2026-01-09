@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::config::{GatewayConfig, ShellMode};
-use crate::docker::ContainerManager;
+use crate::docker::{ContainerManager, DestroyOptions};
 use crate::github::{
     compute_fingerprint_from_pubkey, parse_ssh_username, public_key_to_openssh,
     validate_github_username, validate_project_name, GitHubKeyFetcher,
@@ -540,6 +540,64 @@ impl Handler for ConnectionHandler {
             .project
             .as_ref()
             .ok_or_else(|| anyhow!("No project specified"))?;
+
+        // Gateway control commands (handled by the gateway itself, not inside the container).
+        // This is intentionally a very small "control surface" to keep behavior predictable.
+        if let Some(ctrl) = parse_gateway_control_command(command.trim()) {
+            let (exit_status, output) = match ctrl {
+                GatewayControlCommand::Help => (0u32, gateway_control_help_text()),
+                GatewayControlCommand::Destroy {
+                    yes,
+                    keep_workspace,
+                    dry_run,
+                    force,
+                } => {
+                    if !dry_run && !keep_workspace && !yes {
+                        (
+                            2u32,
+                            format!(
+                                "Refusing to destroy without confirmation.\n\
+This will stop/remove your container(s) and DELETE your persistent workspace.\n\n\
+Run one of:\n\
+  agentman destroy --yes\n\
+  agentman destroy --keep-workspace\n\
+  agentman destroy --dry-run\n"
+                            ),
+                        )
+                    } else {
+                        let opts = DestroyOptions {
+                            keep_workspace,
+                            force,
+                            dry_run,
+                        };
+
+                        match self
+                            .server
+                            .container_manager
+                            .destroy_workspace(github_user, project, opts)
+                            .await
+                        {
+                            Ok(res) => (0u32, res.format_human()),
+                            Err(e) => (1u32, format!("Destroy failed: {e}\n")),
+                        }
+                    }
+                }
+            };
+
+            // Confirm the exec request was accepted (OpenSSH sets want-reply=true).
+            session.channel_success(channel_id)?;
+
+            let handle = session.handle();
+            if !output.is_empty() {
+                let _ = handle
+                    .data(channel_id, CryptoVec::from_slice(output.as_bytes()))
+                    .await;
+            }
+            let _ = handle.exit_status_request(channel_id, exit_status).await;
+            let _ = handle.eof(channel_id).await;
+            let _ = handle.close(channel_id).await;
+            return Ok(());
+        }
 
         // Get or create container
         let container_id = self
@@ -1078,6 +1136,74 @@ fn sanitize_tmux_session_name(name: &str) -> String {
     } else {
         out
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GatewayControlCommand {
+    Help,
+    Destroy {
+        yes: bool,
+        keep_workspace: bool,
+        dry_run: bool,
+        force: bool,
+    },
+}
+
+fn parse_gateway_control_command(cmd: &str) -> Option<GatewayControlCommand> {
+    let mut it = cmd.split_whitespace();
+    let first = it.next()?;
+    if first != "agentman" {
+        return None;
+    }
+
+    let sub = it.next().unwrap_or("help");
+    match sub {
+        "help" | "--help" | "-h" => Some(GatewayControlCommand::Help),
+        "destroy" => {
+            let mut yes = false;
+            let mut keep_workspace = false;
+            let mut dry_run = false;
+            let mut force = false;
+
+            for arg in it {
+                match arg {
+                    "--yes" | "-y" => yes = true,
+                    "--keep-workspace" => keep_workspace = true,
+                    "--dry-run" => dry_run = true,
+                    "--force" => force = true,
+                    "--help" | "-h" => return Some(GatewayControlCommand::Help),
+                    _ => {
+                        // Unknown args fall back to help (keeps behavior stable).
+                        return Some(GatewayControlCommand::Help);
+                    }
+                }
+            }
+
+            Some(GatewayControlCommand::Destroy {
+                yes,
+                keep_workspace,
+                dry_run,
+                force,
+            })
+        }
+        _ => Some(GatewayControlCommand::Help),
+    }
+}
+
+fn gateway_control_help_text() -> String {
+    // Keep this compatible with non-interactive SSH exec flows.
+    "\
+agentman gateway control commands
+
+Usage:
+  agentman destroy [--yes] [--keep-workspace] [--dry-run] [--force]
+
+Notes:
+  - Without --yes, destroy refuses to delete your persistent workspace directory.
+  - --keep-workspace stops/removes container(s) but keeps your files on disk.
+  - --dry-run prints what would be deleted.
+"
+    .to_string()
 }
 
 /// Run the SSH server.

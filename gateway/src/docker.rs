@@ -11,19 +11,78 @@ use bollard::container::{
     Config, CreateContainerOptions,
     StartContainerOptions, InspectContainerOptions,
     ListContainersOptions,
+    StopContainerOptions, RemoveContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults, ResizeExecOptions};
 use bollard::models::HostConfig;
 use bollard::Docker;
 use chrono::Utc;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::process::Command;
 use tracing::{info, warn};
 
 use crate::config::GatewayConfig;
 use crate::state::{StateManager, WorkspaceInfo};
+
+/// Options for destroying a workspace (container(s) + persistent data).
+#[derive(Debug, Clone, Copy)]
+pub struct DestroyOptions {
+    /// If true, do not delete the persistent workspace directory on the host.
+    pub keep_workspace: bool,
+    /// If true, force-remove containers (kill if needed).
+    pub force: bool,
+    /// If true, print what would happen but do not actually delete anything.
+    pub dry_run: bool,
+}
+
+/// Summary of a destroy operation.
+#[derive(Debug, Clone)]
+pub struct DestroyResult {
+    pub removed_containers: Vec<String>,
+    pub workspace_path: PathBuf,
+    pub workspace_deleted: bool,
+    pub state_entry_deleted: bool,
+    pub warnings: Vec<String>,
+}
+
+impl DestroyResult {
+    pub fn format_human(&self) -> String {
+        let mut out = String::new();
+
+        out.push_str("agentman: destroy summary\n");
+        out.push_str(&format!(
+            "- removed containers: {}\n",
+            if self.removed_containers.is_empty() {
+                "(none)".to_string()
+            } else {
+                self.removed_containers.join(", ")
+            }
+        ));
+        out.push_str(&format!(
+            "- workspace path: {}\n",
+            self.workspace_path.display()
+        ));
+        out.push_str(&format!(
+            "- workspace deleted: {}\n",
+            if self.workspace_deleted { "yes" } else { "no" }
+        ));
+        out.push_str(&format!(
+            "- state entry deleted: {}\n",
+            if self.state_entry_deleted { "yes" } else { "no" }
+        ));
+
+        if !self.warnings.is_empty() {
+            out.push_str("- warnings:\n");
+            for w in &self.warnings {
+                out.push_str(&format!("  - {w}\n"));
+            }
+        }
+
+        out
+    }
+}
 
 #[cfg(unix)]
 async fn ensure_workspace_writable(path: &Path) -> Result<()> {
@@ -195,6 +254,16 @@ impl ContainerManager {
         let workspace_path = self.config.workspace_path(github_user, project);
         ensure_workspace_writable(&workspace_path).await?;
 
+        let labels: HashMap<String, String> = HashMap::from([
+            ("agentman.managed".to_string(), "true".to_string()),
+            ("agentman.github_user".to_string(), github_user.to_string()),
+            ("agentman.project".to_string(), project.to_string()),
+            (
+                "agentman.workspace_path".to_string(),
+                workspace_path.display().to_string(),
+            ),
+        ]);
+
         // Build container configuration
         let host_config = self.build_host_config(&workspace_path)?;
         let env = self.build_env(github_user, project, &container_name);
@@ -203,6 +272,7 @@ impl ContainerManager {
             image: Some(self.config.docker_image.clone()),
             hostname: Some(container_name.clone()),
             env: Some(env),
+            labels: Some(labels),
             host_config: Some(host_config),
             working_dir: Some("/workspace".to_string()),
             tty: Some(true),
@@ -494,6 +564,167 @@ impl ContainerManager {
     /// Get a reference to the Docker client.
     pub fn docker(&self) -> &Docker {
         &self.docker
+    }
+
+    /// Destroy a workspace:
+    /// - Stop/remove any managed container(s) for (github_user, project)
+    /// - Optionally delete the persistent workspace directory on the host
+    /// - Remove the workspace entry from the gateway state file
+    pub async fn destroy_workspace(
+        &self,
+        github_user: &str,
+        project: &str,
+        opts: DestroyOptions,
+    ) -> Result<DestroyResult> {
+        let mut warnings = Vec::new();
+
+        // Workspace path is derived from config (safe and deterministic).
+        let workspace_path = self.config.workspace_path(github_user, project);
+
+        // Collect targets:
+        // - state-mapped container id/name (works even for older containers without labels)
+        // - any currently running/stopped containers labeled as managed for this workspace
+        let mut targets: Vec<String> = Vec::new();
+        if let Some(ws) = self.state.get_workspace(github_user, project).await {
+            if let Some(id) = ws.container_id {
+                targets.push(id);
+            }
+            // Removing by name also works if the ID is stale/missing.
+            targets.push(ws.container_name);
+        }
+
+        // Add labeled containers (newer containers).
+        match self.list_labeled_workspace_containers(github_user, project).await {
+            Ok(mut ids) => targets.append(&mut ids),
+            Err(e) => warnings.push(format!("failed to list labeled containers: {e}")),
+        }
+
+        // Deduplicate targets.
+        targets.sort();
+        targets.dedup();
+
+        let mut removed_containers = Vec::new();
+
+        for target in targets {
+            if opts.dry_run {
+                removed_containers.push(format!("{target} (dry-run)"));
+                continue;
+            }
+
+            // Best-effort stop first (unless forced).
+            if !opts.force {
+                match self
+                    .docker
+                    .stop_container(&target, Some(StopContainerOptions { t: 10 }))
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404, ..
+                    }) => {
+                        // Already gone.
+                    }
+                    Err(e) => {
+                        warnings.push(format!("stop container {target}: {e}"));
+                    }
+                }
+            }
+
+            let rm_opts = RemoveContainerOptions {
+                force: opts.force,
+                v: true,
+                link: false,
+            };
+
+            match self.docker.remove_container(&target, Some(rm_opts)).await {
+                Ok(_) => {
+                    removed_containers.push(target);
+                }
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {
+                    // Not found; ignore.
+                }
+                Err(e) => {
+                    warnings.push(format!("remove container {target}: {e}"));
+                }
+            }
+        }
+
+        // Delete persistent workspace directory.
+        let mut workspace_deleted = false;
+        if !opts.keep_workspace {
+            if opts.dry_run {
+                if workspace_path.exists() {
+                    workspace_deleted = true;
+                }
+            } else if workspace_path.exists() {
+                tokio::fs::remove_dir_all(&workspace_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to delete workspace directory: {}",
+                            workspace_path.display()
+                        )
+                    })?;
+                workspace_deleted = true;
+            }
+        }
+
+        // Remove the workspace entry from state.
+        let state_entry_deleted = if opts.dry_run {
+            false
+        } else {
+            self.state
+                .remove_workspace(github_user, project)
+                .await?
+                .is_some()
+        };
+
+        Ok(DestroyResult {
+            removed_containers,
+            workspace_path,
+            workspace_deleted,
+            state_entry_deleted,
+            warnings,
+        })
+    }
+
+    async fn list_labeled_workspace_containers(
+        &self,
+        github_user: &str,
+        project: &str,
+    ) -> Result<Vec<String>> {
+        let filters: HashMap<String, Vec<String>> = HashMap::from([(
+            "label".to_string(),
+            vec!["agentman.managed=true".to_string()],
+        )]);
+
+        let options = ListContainersOptions {
+            all: true,
+            filters,
+            ..Default::default()
+        };
+
+        let containers = self
+            .docker
+            .list_containers(Some(options))
+            .await
+            .context("Failed to list containers")?;
+
+        let mut out = Vec::new();
+        for c in containers {
+            let labels = c.labels.unwrap_or_default();
+            let matches = labels.get("agentman.github_user").map(|v| v.as_str()) == Some(github_user)
+                && labels.get("agentman.project").map(|v| v.as_str()) == Some(project);
+            if !matches {
+                continue;
+            }
+            if let Some(id) = c.id {
+                out.push(id);
+            }
+        }
+        Ok(out)
     }
 }
 

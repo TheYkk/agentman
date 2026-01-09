@@ -181,4 +181,21 @@ impl StateManager {
             .into_iter()
             .collect()
     }
+
+    /// Remove a workspace mapping (and persist the state file).
+    ///
+    /// Returns the removed workspace info, if it existed.
+    pub async fn remove_workspace(
+        &self,
+        github_user: &str,
+        project: &str,
+    ) -> Result<Option<WorkspaceInfo>> {
+        let key = WorkspaceInfo::key(github_user, project);
+        let removed = {
+            let mut state = self.state.write().await;
+            state.workspaces.remove(&key)
+        };
+        self.save().await?;
+        Ok(removed)
+    }
 }
