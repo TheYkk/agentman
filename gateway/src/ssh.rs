@@ -68,17 +68,22 @@ pub struct ConnectionHandler {
     /// We cache all of them once GitHub verification succeeds.
     offered_key_fingerprints: Vec<String>,
 
-    /// PTY dimensions (cols, rows) from pty_request.
-    pty_size: Option<(u32, u32)>,
-
-    /// Terminal type from pty_request.
-    term: Option<String>,
+    /// PTY info per SSH channel (set by pty_request).
+    ptys: HashMap<ChannelId, PtyInfo>,
 }
 
 struct ExecSession {
     exec_id: String,
+    tty: bool,
     /// Channel for sending data to the container.
     stdin_tx: Option<mpsc::Sender<Vec<u8>>>,
+}
+
+#[derive(Debug, Clone)]
+struct PtyInfo {
+    term: String,
+    cols: u32,
+    rows: u32,
 }
 
 impl ConnectionHandler {
@@ -93,8 +98,7 @@ impl ConnectionHandler {
             pending_github_user: None,
             remote_forwards: HashMap::new(),
             offered_key_fingerprints: Vec::new(),
-            pty_size: None,
-            term: None,
+            ptys: HashMap::new(),
         }
     }
 }
@@ -378,7 +382,7 @@ impl Handler for ConnectionHandler {
     /// Handle PTY request.
     async fn pty_request(
         &mut self,
-        _channel_id: ChannelId,
+        channel_id: ChannelId,
         term: &str,
         col_width: u32,
         row_height: u32,
@@ -388,12 +392,19 @@ impl Handler for ConnectionHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         debug!(
-            "PTY request: term={}, cols={}, rows={}",
-            term, col_width, row_height
+            "PTY request: channel={:?}, term={}, cols={}, rows={}",
+            channel_id, term, col_width, row_height
         );
-        // Store PTY dimensions for use when creating exec
-        self.pty_size = Some((col_width, row_height));
-        self.term = Some(term.to_string());
+        // Store PTY info for use when creating exec
+        let term = if term.is_empty() { "xterm-256color" } else { term };
+        self.ptys.insert(
+            channel_id,
+            PtyInfo {
+                term: term.to_string(),
+                cols: col_width,
+                rows: row_height,
+            },
+        );
         Ok(())
     }
 
@@ -423,18 +434,27 @@ impl Handler for ConnectionHandler {
 
         self.container_id = Some(container_id.clone());
 
-        // Use stored TERM from pty_request, or default
-        let term = self.term.as_deref().unwrap_or("xterm-256color");
+        let (tty, term) = match self.ptys.get(&channel_id) {
+            Some(pty) => (true, pty.term.as_str()),
+            None => (false, "xterm-256color"),
+        };
 
         let cmd = match self.server.config.shell.mode {
             ShellMode::Bash => vec!["bash".to_string(), "-l".to_string()],
             ShellMode::Tmux => {
-                let session_name = sanitize_tmux_session_name(&self.server.config.shell.tmux_session);
-                let script = format!(
-                    "if command -v tmux >/dev/null 2>&1; then exec tmux new-session -A -s '{session}' -c /workspace bash -l; else exec bash -l; fi",
-                    session = session_name
-                );
-                vec!["bash".to_string(), "-lc".to_string(), script]
+                // Only start tmux when the client requested a PTY (true interactive session).
+                // This avoids breaking editor/bootstrap flows that use non-PTY sessions.
+                if tty {
+                    let session_name =
+                        sanitize_tmux_session_name(&self.server.config.shell.tmux_session);
+                    let script = format!(
+                        "if command -v tmux >/dev/null 2>&1; then exec tmux new-session -A -s '{session}' -c /workspace bash -l; else exec bash -l; fi",
+                        session = session_name
+                    );
+                    vec!["bash".to_string(), "-lc".to_string(), script]
+                } else {
+                    vec!["bash".to_string(), "-l".to_string()]
+                }
             }
         };
 
@@ -445,20 +465,21 @@ impl Handler for ConnectionHandler {
             .create_exec(
                 &container_id,
                 cmd,
-                true,
-                Some(vec![format!("TERM={}", term)]),
+                tty,
+                tty.then(|| vec![format!("TERM={}", term)]),
             )
             .await?;
 
         // Start exec and connect to channel
-        self.start_exec_session(channel_id, exec_id.clone(), session).await?;
+        self.start_exec_session(channel_id, exec_id.clone(), tty, session)
+            .await?;
 
         // Resize to stored PTY dimensions
-        if let Some((cols, rows)) = self.pty_size {
+        if let Some(pty) = self.ptys.get(&channel_id) {
             if let Err(e) = self
                 .server
                 .container_manager
-                .resize_exec(&exec_id, cols as u16, rows as u16)
+                .resize_exec(&exec_id, pty.cols as u16, pty.rows as u16)
                 .await
             {
                 warn!("Failed to set initial exec size: {}", e);
@@ -496,8 +517,10 @@ impl Handler for ConnectionHandler {
 
         self.container_id = Some(container_id.clone());
 
-        // Use stored TERM from pty_request, or default
-        let term = self.term.as_deref().unwrap_or("xterm-256color");
+        let (tty, term) = match self.ptys.get(&channel_id) {
+            Some(pty) => (true, pty.term.as_str()),
+            None => (false, "xterm-256color"),
+        };
 
         // Create exec in container
         let exec_id = self
@@ -505,21 +528,24 @@ impl Handler for ConnectionHandler {
             .container_manager
             .create_exec(
                 &container_id,
-                vec!["bash".to_string(), "-lc".to_string(), command],
-                true,
-                Some(vec![format!("TERM={}", term)]),
+                // Exec requests should behave like standard sshd: don't force a login shell.
+                // This avoids user rc files (e.g. tmux auto-attach) breaking editor bootstrap flows.
+                vec!["bash".to_string(), "-c".to_string(), command],
+                tty,
+                tty.then(|| vec![format!("TERM={}", term)]),
             )
             .await?;
 
         // Start exec and connect to channel
-        self.start_exec_session(channel_id, exec_id.clone(), session).await?;
+        self.start_exec_session(channel_id, exec_id.clone(), tty, session)
+            .await?;
 
         // Resize to stored PTY dimensions
-        if let Some((cols, rows)) = self.pty_size {
+        if let Some(pty) = self.ptys.get(&channel_id) {
             if let Err(e) = self
                 .server
                 .container_manager
-                .resize_exec(&exec_id, cols as u16, rows as u16)
+                .resize_exec(&exec_id, pty.cols as u16, pty.rows as u16)
                 .await
             {
                 warn!("Failed to set initial exec size: {}", e);
@@ -544,7 +570,15 @@ impl Handler for ConnectionHandler {
             channel_id, col_width, row_height
         );
 
+        if let Some(pty) = self.ptys.get_mut(&channel_id) {
+            pty.cols = col_width;
+            pty.rows = row_height;
+        }
+
         if let Some(exec_session) = self.exec_sessions.get(&channel_id) {
+            if !exec_session.tty {
+                return Ok(());
+            }
             if let Err(e) = self
                 .server
                 .container_manager
@@ -581,6 +615,7 @@ impl Handler for ConnectionHandler {
     ) -> Result<(), Self::Error> {
         debug!("Channel closed: {:?}", channel_id);
         self.exec_sessions.remove(&channel_id);
+        self.ptys.remove(&channel_id);
         Ok(())
     }
 
@@ -860,6 +895,7 @@ impl ConnectionHandler {
         &mut self,
         channel_id: ChannelId,
         exec_id: String,
+        tty: bool,
         session: &mut Session,
     ) -> Result<()> {
         let _docker = self.server.container_manager.docker().clone();
@@ -868,7 +904,7 @@ impl ConnectionHandler {
         let results = self
             .server
             .container_manager
-            .start_exec(&exec_id)
+            .start_exec(&exec_id, tty)
             .await?;
 
         // Create channel for stdin
@@ -878,6 +914,7 @@ impl ConnectionHandler {
             channel_id,
             ExecSession {
                 exec_id: exec_id.clone(),
+                tty,
                 stdin_tx: Some(stdin_tx),
             },
         );

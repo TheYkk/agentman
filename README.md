@@ -42,7 +42,7 @@ The **agentman-gateway** is a Rust SSH server that provides streamlined access t
    # After first auth, just use the project name
    ssh myproject@agent-server
    ```
-   Tip: interactive sessions attach to `tmux` by default — detach with `Ctrl-b d`, then reconnect to resume.
+  Tip: interactive sessions (PTY) attach to `tmux` by default — detach with `Ctrl-b d`, then reconnect to resume. Non-interactive SSH commands (editor bootstrap) are not wrapped in tmux.
 
 3. **Add to ~/.ssh/config** for convenience:
    ```
@@ -76,7 +76,7 @@ The **agentman-gateway** is a Rust SSH server that provides streamlined access t
 2. **Key Verification**: Gateway checks your SSH public key against GitHub's API
 3. **Container Provisioning**: Creates/starts a container named `project-github-YYYYMMDD`
 4. **Workspace Persistence**: Bind-mounts `/var/lib/agentman/workspaces/<github>/<project>` to `/workspace`
-5. **Session**: Your interactive shell runs inside the container via Docker exec (attached to a persistent `tmux` session by default)
+5. **Session**: Your interactive shell runs inside the container via Docker exec (attached to a persistent `tmux` session by default when a PTY is requested)
 
 ### Authentication Flow
 

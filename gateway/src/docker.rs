@@ -371,10 +371,10 @@ impl ContainerManager {
     }
 
     /// Start an exec instance and return the multiplexed stream.
-    pub async fn start_exec(&self, exec_id: &str) -> Result<StartExecResults> {
+    pub async fn start_exec(&self, exec_id: &str, tty: bool) -> Result<StartExecResults> {
         let options = StartExecOptions {
             detach: false,
-            tty: true,
+            tty,
             output_capacity: None,
         };
 
