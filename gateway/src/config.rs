@@ -4,6 +4,44 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Interactive shell/session configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShellConfig {
+    /// How interactive shells are started.
+    pub mode: ShellMode,
+
+    /// Tmux session name to attach/create when `mode = "tmux"`.
+    ///
+    /// The session lives inside each agent container and enables reconnect/resume.
+    pub tmux_session: String,
+}
+
+impl Default for ShellConfig {
+    fn default() -> Self {
+        Self {
+            mode: ShellMode::Tmux,
+            tmux_session: "agentman".to_string(),
+        }
+    }
+}
+
+/// How to start an interactive shell when the user connects.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShellMode {
+    /// Start a plain login shell (`bash -l`).
+    Bash,
+    /// Attach to (or create) a persistent tmux session.
+    Tmux,
+}
+
+impl Default for ShellMode {
+    fn default() -> Self {
+        Self::Tmux
+    }
+}
+
 /// Main gateway configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -31,6 +69,10 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub port_forwarding: PortForwardingConfig,
 
+    /// Interactive shell/session configuration
+    #[serde(default)]
+    pub shell: ShellConfig,
+
     /// Container security configuration
     #[serde(default)]
     pub container_security: ContainerSecurityConfig,
@@ -50,6 +92,7 @@ impl Default for GatewayConfig {
             host_key_path: data_dir.join("host_key"),
             bootstrap_github_users: Vec::new(),
             port_forwarding: PortForwardingConfig::default(),
+            shell: ShellConfig::default(),
             container_security: ContainerSecurityConfig::default(),
         }
     }
@@ -151,6 +194,7 @@ impl GatewayConfig {
     }
 
     /// Save configuration to a TOML file.
+    #[allow(dead_code)]
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)

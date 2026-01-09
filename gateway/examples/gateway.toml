@@ -22,6 +22,12 @@ host_key_path = "/var/lib/agentman/host_key"
 # Useful for small teams where you know all users upfront
 bootstrap_github_users = []
 
+[shell]
+# Start interactive sessions inside tmux so you can disconnect/reconnect and resume.
+mode = "tmux"
+# tmux session name inside each container
+tmux_session = "agentman"
+
 [port_forwarding]
 # Allow local port forwarding (ssh -L)
 allow_local = true

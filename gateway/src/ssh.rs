@@ -22,7 +22,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::config::GatewayConfig;
+use crate::config::{GatewayConfig, ShellMode};
 use crate::docker::ContainerManager;
 use crate::github::{
     compute_fingerprint_from_pubkey, parse_ssh_username, public_key_to_openssh,
@@ -426,13 +426,25 @@ impl Handler for ConnectionHandler {
         // Use stored TERM from pty_request, or default
         let term = self.term.as_deref().unwrap_or("xterm-256color");
 
+        let cmd = match self.server.config.shell.mode {
+            ShellMode::Bash => vec!["bash".to_string(), "-l".to_string()],
+            ShellMode::Tmux => {
+                let session_name = sanitize_tmux_session_name(&self.server.config.shell.tmux_session);
+                let script = format!(
+                    "if command -v tmux >/dev/null 2>&1; then exec tmux new-session -A -s '{session}' -c /workspace bash -l; else exec bash -l; fi",
+                    session = session_name
+                );
+                vec!["bash".to_string(), "-lc".to_string(), script]
+            }
+        };
+
         // Create exec in container
         let exec_id = self
             .server
             .container_manager
             .create_exec(
                 &container_id,
-                vec!["bash".to_string(), "-l".to_string()],
+                cmd,
                 true,
                 Some(vec![format!("TERM={}", term)]),
             )
@@ -933,6 +945,22 @@ fn is_localhost(host: &str) -> bool {
         || host == "::1"
         || host == "[::1]"
         || host == "0.0.0.0"
+}
+
+fn sanitize_tmux_session_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "agentman".to_string()
+    } else {
+        out
+    }
 }
 
 /// Run the SSH server.
