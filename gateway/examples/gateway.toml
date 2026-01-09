@@ -1,0 +1,63 @@
+# Agentman Gateway Configuration
+# Copy to /etc/agentman/gateway.toml and customize
+
+# SSH server listen address
+listen_addr = "0.0.0.0:2222"
+
+# Docker image to use for agent containers
+docker_image = "agentman-base:dev"
+
+# Root path for persistent workspaces
+# Each (github_user, project) gets a subdirectory here
+workspace_root = "/var/lib/agentman/workspaces"
+
+# Path to the state file (key cache, container mappings)
+state_file = "/var/lib/agentman/state.json"
+
+# Path to the SSH host key (generated automatically if missing)
+host_key_path = "/var/lib/agentman/host_key"
+
+# Bootstrap GitHub usernames
+# Keys from these users are auto-matched without requiring project+username syntax
+# Useful for small teams where you know all users upfront
+bootstrap_github_users = []
+
+[port_forwarding]
+# Allow local port forwarding (ssh -L)
+allow_local = true
+
+# Allow remote port forwarding (ssh -R)
+allow_remote = true
+
+# Allow binding on non-loopback addresses for -R
+# If false, -R binds only to 127.0.0.1 regardless of client request
+allow_gateway_ports = false
+
+# Allow forwarding to non-local destinations
+# If false, only localhost/127.0.0.1/container IP allowed
+allow_nonlocal_destinations = false
+
+[container_security]
+# Drop all Linux capabilities
+cap_drop_all = true
+
+# Capabilities to add back (if cap_drop_all is true)
+# These are the minimum needed for typical development workflows
+cap_add = ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]
+
+# Enable no-new-privileges
+# Prevents privilege escalation via setuid binaries
+no_new_privileges = true
+
+# Use read-only root filesystem
+# Set to true for maximum security (requires tmpfs for /tmp, /var, etc.)
+readonly_rootfs = false
+
+# Memory limit (e.g., "4g", "512m")
+memory_limit = "4g"
+
+# CPU limit (e.g., 2.0 for 2 CPUs)
+cpu_limit = 2.0
+
+# Use default seccomp profile
+use_seccomp = true

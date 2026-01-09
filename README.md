@@ -1,4 +1,4 @@
-## agentman base image
+## agentman
 
 Debian-based base image for a coding agent with pinned versions of:
 - **Rust** (via `rustup`) + pinned toolchain
@@ -14,14 +14,212 @@ Python is installed using uv per the official guide: `https://docs.astral.sh/uv/
 
 `opencode` refers to the OpenCode project: `https://github.com/anomalyco/opencode`.
 
-## Configure versions
+## SSH Gateway
+
+The **agentman-gateway** is a Rust SSH server that provides streamlined access to agent containers. It automatically:
+
+- Authenticates users via SSH public keys (verified against GitHub)
+- Creates/manages Docker containers per project
+- Persists `/workspace` across sessions
+- Supports port forwarding for development workflows
+
+### Quick Start
+
+1. **Start the gateway** on your server:
+   ```bash
+   # Generate default config
+   agentman-gateway --generate-config > /etc/agentman/gateway.toml
+
+   # Run the gateway
+   agentman-gateway -c /etc/agentman/gateway.toml
+   ```
+
+2. **Connect from your laptop**:
+   ```bash
+   # First time: provide your GitHub username
+   ssh myproject+octocat@agent-server
+
+   # After first auth, just use the project name
+   ssh myproject@agent-server
+   ```
+
+3. **Add to ~/.ssh/config** for convenience:
+   ```
+   Host agent
+     HostName agent-server.example.com
+     Port 2222
+     User myproject+octocat
+   ```
+
+   Then simply:
+   ```bash
+   ssh agent
+   ```
+
+### How It Works
+
+```
+┌─────────────┐     SSH      ┌──────────────────┐     Docker     ┌─────────────────┐
+│  Your       │ ──────────▶  │  agentman-       │ ─────────────▶ │  Agent          │
+│  Laptop     │              │  gateway         │                │  Container      │
+└─────────────┘              └──────────────────┘                └─────────────────┘
+                                    │                                    │
+                                    ▼                                    ▼
+                             ┌──────────────┐                    ┌───────────────┐
+                             │ State Cache  │                    │  /workspace   │
+                             │ (key→github) │                    │  (persistent) │
+                             └──────────────┘                    └───────────────┘
+```
+
+1. **SSH Connection**: You connect to the gateway using `ssh project@gateway`
+2. **Key Verification**: Gateway checks your SSH public key against GitHub's API
+3. **Container Provisioning**: Creates/starts a container named `project-github-YYYYMMDD`
+4. **Workspace Persistence**: Bind-mounts `/var/lib/agentman/workspaces/<github>/<project>` to `/workspace`
+5. **Session**: Your shell runs inside the container via Docker exec
+
+### Authentication Flow
+
+The gateway supports two authentication modes:
+
+**Non-interactive (for editors like Zed/VS Code)**:
+```bash
+ssh myproject+octocat@gateway
+```
+The `+octocat` tells the gateway your GitHub username. It verifies your SSH key is in `github.com/octocat.keys` and caches the mapping.
+
+**Interactive (first time from terminal)**:
+```bash
+ssh myproject@gateway
+# Gateway prompts: "GitHub username: "
+# You enter: octocat
+# Gateway verifies and caches
+```
+
+After the first successful auth, the key→GitHub mapping is cached, so you can just use `ssh myproject@gateway`.
+
+### Port Forwarding
+
+**Local forwarding (`-L`)** — Access container services from your laptop:
+```bash
+# Forward local:8080 to container:3000
+ssh -L 8080:localhost:3000 myproject@gateway
+```
+
+**Remote forwarding (`-R`)** — Expose local services to the container:
+```bash
+# Make localhost:9000 accessible as host.docker.internal:9000 inside the container
+ssh -R 9000:localhost:9000 myproject@gateway
+```
+
+This is useful for:
+- Running a dev server locally and accessing it from the container
+- Exposing your local language server to remote code
+- Sharing a local database with the container
+
+### Editor Integration
+
+**Zed Editor**:
+1. Add to `~/.ssh/config`:
+   ```
+   Host agent
+     HostName your-server.com
+     Port 2222
+     User myproject+yourgithub
+   ```
+2. In Zed: `Cmd+Shift+P` → "Remote: Connect to Host..." → `agent`
+
+**VS Code Remote-SSH**:
+1. Add same config to `~/.ssh/config`
+2. Open Command Palette → "Remote-SSH: Connect to Host..." → `agent`
+
+**Cursor**:
+Works the same as VS Code Remote-SSH.
+
+### Configuration
+
+Generate default config:
+```bash
+agentman-gateway --generate-config
+```
+
+Example `/etc/agentman/gateway.toml`:
+```toml
+listen_addr = "0.0.0.0:2222"
+docker_image = "agentman-base:dev"
+workspace_root = "/var/lib/agentman/workspaces"
+state_file = "/var/lib/agentman/state.json"
+host_key_path = "/var/lib/agentman/host_key"
+
+# Pre-authorized GitHub users (auto-matched on first connect)
+bootstrap_github_users = ["octocat", "defunkt"]
+
+[port_forwarding]
+allow_local = true      # Allow -L (local port forward)
+allow_remote = true     # Allow -R (remote port forward)
+allow_gateway_ports = false  # Bind -R only to loopback
+allow_nonlocal_destinations = false  # Only forward to localhost/container
+
+[container_security]
+cap_drop_all = true
+cap_add = ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]
+no_new_privileges = true
+readonly_rootfs = false
+memory_limit = "4g"
+cpu_limit = 2.0
+use_seccomp = true
+```
+
+### Container Security
+
+Containers are created with security hardening by default:
+
+- **No privileged mode**: Containers never run privileged
+- **No Docker socket**: Container cannot escape to host via Docker API
+- **Capability dropping**: All caps dropped, minimal set re-added
+- **No-new-privileges**: Prevents privilege escalation via setuid binaries
+- **Seccomp**: Default Docker seccomp profile applied
+- **Resource limits**: Memory and CPU limits enforced
+- **Isolated networking**: Bridge network only, no host network
+
+The `/workspace` bind-mount is the only host path exposed to containers.
+
+### Container Naming
+
+Containers follow the pattern: `{project}-{github}-{YYYYMMDD}`
+
+Example: `myproject-octocat-20260109`
+
+If multiple containers exist for the same project/user/date, a suffix is added: `myproject-octocat-20260109-1`
+
+### Workspace Persistence
+
+Each `(github_user, project)` pair gets a persistent workspace directory:
+```
+/var/lib/agentman/workspaces/
+└── octocat/
+    ├── myproject/
+    │   └── (your code here, persisted across container restarts)
+    └── another-project/
+        └── ...
+```
+
+The workspace is bind-mounted to `/workspace` inside the container. This persists across:
+- Container restarts
+- New container creation (e.g., after image updates)
+- Gateway restarts
+
+---
+
+## Base Image
+
+### Configure versions
 
 Edit `docker/versions.env`:
 - **Base image**: `DEBIAN_TAG`
 - **Tools**: `RUSTUP_VERSION`, `RUST_TOOLCHAIN`, `GO_VERSION`, `BUN_VERSION`, `UV_VERSION`, `PYTHON_VERSION`, `SDKMAN_VERSION`, `JAVA_VERSION`, `DUCKDB_VERSION`, `OPENCODE_VERSION`
 - **User**: `USERNAME`, `USER_UID`, `USER_GID`
 
-## Build (local)
+### Build (local)
 
 Requires Docker BuildKit + buildx.
 
@@ -47,76 +245,7 @@ Open a shell instead:
 docker run --rm -it --entrypoint bash agentman-base:dev
 ```
 
-## Remote SSH Access
-
-The Docker image includes SSH server support for remote access. This is useful for connecting with editors like Zed.
-
-The `agent` user has full root privileges via `sudo` (NOPASSWD) and is configured for SSH access.
-
-### Starting the Container with SSH
-
-To start the container with SSH enabled, set the `GITHUB_USERNAME` environment variable to automatically download and configure your SSH keys:
-
-```bash
-docker run -d \
-  --name agentman \
-  -p 2222:22 \
-  -e GITHUB_USERNAME=your-github-username \
-  agentman-base:dev
-```
-
-This will:
-- Download your SSH public keys from `https://github.com/your-github-username.keys`
-- Add them to `~/.ssh/authorized_keys` in the container
-- Start the SSH server on port 22 (mapped to host port 2222)
-
-### Connecting with Zed Editor
-
-1. **Start the container** (as shown above):
-   ```bash
-   docker run -d \
-     --name agentman \
-     -p 2222:22 \
-     -e GITHUB_USERNAME=your-github-username \
-     agentman-base:dev
-   ```
-
-2. **Find the container's IP address**:
-   ```bash
-   docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' agentman
-   ```
-   Or if using host networking:
-   ```bash
-   docker run -d \
-     --name agentman \
-     --network host \
-     -e GITHUB_USERNAME=your-github-username \
-     agentman-base:dev
-   ```
-
-3. **In Zed Editor**:
-   - Open the command palette (Cmd/Ctrl + Shift + P)
-   - Select "Remote: Connect to Host..."
-   - Enter: `agent@localhost:2222` (or use the container IP if not using port mapping)
-   - Zed will connect using your SSH key
-
-**Note**: Make sure your SSH public key is uploaded to your GitHub account (Settings → SSH and GPG keys) for the automatic key setup to work.
-
-### Manual SSH Connection
-
-You can also connect manually via SSH:
-
-```bash
-ssh -p 2222 agent@localhost
-```
-
-Or if using the container IP directly:
-
-```bash
-ssh agent@<container-ip>
-```
-
-## Build/push (CI / multi-arch)
+### Build/push (CI / multi-arch)
 
 Set `PLATFORMS` in `docker/versions.env` (example):
 
@@ -130,3 +259,25 @@ Then:
 ./scripts/push.sh
 ```
 
+---
+
+## Legacy: Direct SSH Access
+
+The Docker image also includes a built-in SSH server for direct container access (without the gateway).
+
+To start a container with SSH enabled:
+
+```bash
+docker run -d \
+  --name agentman \
+  -p 2222:22 \
+  -e GITHUB_USERNAME=your-github-username \
+  agentman-base:dev
+```
+
+Connect:
+```bash
+ssh -p 2222 agent@localhost
+```
+
+**Note**: This legacy mode doesn't provide the gateway's features (automatic container management, persistence, port forwarding to container). Use the gateway for production workflows.

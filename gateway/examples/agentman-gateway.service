@@ -1,0 +1,24 @@
+[Unit]
+Description=Agentman SSH Gateway
+Documentation=https://github.com/your-org/agentman
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/agentman-gateway -c /etc/agentman/gateway.toml
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/var/lib/agentman
+
+# Allow binding to privileged ports if needed (e.g., port 22)
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
