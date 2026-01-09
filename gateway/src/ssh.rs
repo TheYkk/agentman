@@ -19,7 +19,7 @@ use russh::server::{Auth, Handler, Msg, Session};
 use russh::{Channel, ChannelId, CryptoVec, MethodKind, MethodSet};
 use russh::keys::PublicKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -85,6 +85,14 @@ struct PtyInfo {
     term: String,
     cols: u32,
     rows: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelStreamKind {
+    /// Normal SSH session channels (shell/exec): return exit-status and keep stderr separate.
+    Session,
+    /// TCP forwarding channels (direct-tcpip / forwarded-tcpip): treat as raw byte streams.
+    TcpForward,
 }
 
 fn exec_env(tty: bool, term: &str) -> Vec<String> {
@@ -487,7 +495,13 @@ impl Handler for ConnectionHandler {
             .await?;
 
         // Start exec and connect to channel
-        self.start_exec_session(channel_id, exec_id.clone(), tty, session)
+        self.start_exec_session(
+            channel_id,
+            exec_id.clone(),
+            tty,
+            ChannelStreamKind::Session,
+            session,
+        )
             .await?;
 
         // Confirm the shell request was accepted (client may be waiting on this).
@@ -556,7 +570,13 @@ impl Handler for ConnectionHandler {
             .await?;
 
         // Start exec and connect to channel
-        self.start_exec_session(channel_id, exec_id.clone(), tty, session)
+        self.start_exec_session(
+            channel_id,
+            exec_id.clone(),
+            tty,
+            ChannelStreamKind::Session,
+            session,
+        )
             .await?;
 
         // Confirm the exec request was accepted (OpenSSH sets want-reply=true).
@@ -663,7 +683,7 @@ impl Handler for ConnectionHandler {
         port_to_connect: u32,
         originator_address: &str,
         originator_port: u32,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<bool, Self::Error> {
         if !self.server.config.port_forwarding.allow_local {
             warn!("Local port forwarding disabled");
@@ -675,83 +695,59 @@ impl Handler for ConnectionHandler {
             host_to_connect, port_to_connect, originator_address, originator_port
         );
 
-        // Determine target address
-        let target_addr = if is_localhost(host_to_connect) {
-            // Forward to container's IP
-            if let Some(ref container_id) = self.container_id {
-                match self
+        // Ensure we have a container for this connection. VS Code Remote-SSH relies heavily on
+        // connecting to loopback ports (127.0.0.1) *inside* the remote environment.
+        let github_user = self
+            .github_user
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not authenticated"))?;
+        let project = self
+            .project
+            .as_ref()
+            .ok_or_else(|| anyhow!("No project specified"))?;
+
+        let container_id = match self.container_id.clone() {
+            Some(id) => id,
+            None => {
+                let id = self
                     .server
                     .container_manager
-                    .get_container_ip(container_id)
-                    .await
-                {
-                    Ok(ip) => format!("{}:{}", ip, port_to_connect),
-                    Err(e) => {
-                        warn!("Failed to get container IP: {}", e);
-                        return Ok(false);
-                    }
-                }
-            } else {
-                warn!("No container for port forward");
-                return Ok(false);
+                    .get_or_create_container(github_user, project)
+                    .await?;
+                self.container_id = Some(id.clone());
+                id
             }
+        };
+
+        // Determine destination inside the container.
+        // - For localhost requests: always connect to 127.0.0.1 inside the container (supports services bound to loopback).
+        // - For non-local destinations: only allow if explicitly enabled by policy.
+        let dest_host = if is_localhost(host_to_connect) {
+            "127.0.0.1".to_string()
         } else if self.server.config.port_forwarding.allow_nonlocal_destinations {
-            format!("{}:{}", host_to_connect, port_to_connect)
+            host_to_connect.to_string()
         } else {
-            warn!(
-                "Non-local destination {} denied by policy",
-                host_to_connect
-            );
+            warn!("Non-local destination {} denied by policy", host_to_connect);
             return Ok(false);
         };
 
-        // Spawn task to handle the forward
-        let _channel_id = channel.id();
-        tokio::spawn(async move {
-            match TcpStream::connect(&target_addr).await {
-                Ok(mut stream) => {
-                    let (mut read_half, mut write_half) = stream.split();
-                    let channel = channel;
+        // Use socat inside the container to connect and bridge bytes. This avoids needing access to
+        // the container's loopback from the gateway host (bridge networking).
+        let cmd = vec![
+            "socat".to_string(),
+            "-".to_string(),
+            format!("TCP:{}:{}", dest_host, port_to_connect),
+        ];
 
-                    // Forward data in both directions
-                    let (_tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
+        let exec_id = self
+            .server
+            .container_manager
+            .create_exec(&container_id, cmd, false, None)
+            .await?;
 
-                    // Channel -> TCP
-                    let write_task = async {
-                        while let Some(data) = rx.recv().await {
-                            if write_half.write_all(&data).await.is_err() {
-                                break;
-                            }
-                        }
-                    };
-
-                    // TCP -> Channel
-                    let read_task = async {
-                        let mut buf = vec![0u8; 32768];
-                        loop {
-                            match read_half.read(&mut buf).await {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    if channel.data(&buf[..n]).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        let _ = channel.eof().await;
-                    };
-
-                    tokio::select! {
-                        _ = write_task => {}
-                        _ = read_task => {}
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to connect to {}: {}", target_addr, e);
-                }
-            }
-        });
+        // Treat direct-tcpip as a raw byte stream: no exit-status and no SSH stderr extended-data.
+        self.start_exec_session(channel.id(), exec_id, false, ChannelStreamKind::TcpForward, session)
+            .await?;
 
         Ok(true)
     }
@@ -918,6 +914,7 @@ impl ConnectionHandler {
         channel_id: ChannelId,
         exec_id: String,
         tty: bool,
+        kind: ChannelStreamKind,
         session: &mut Session,
     ) -> Result<()> {
         let docker = self.server.container_manager.docker().clone();
@@ -964,17 +961,29 @@ impl ConnectionHandler {
                                 Ok(output) => {
                                     match output {
                                         LogOutput::StdErr { message } => {
-                                            // Keep stderr separate so tools like Zed can use stdout as a clean transport.
-                                            if handle
-                                                .extended_data(
-                                                    channel_id,
-                                                    1, // SSH_EXTENDED_DATA_STDERR
-                                                    CryptoVec::from_slice(message.as_ref()),
-                                                )
-                                                .await
-                                                .is_err()
-                                            {
-                                                break;
+                                            match kind {
+                                                ChannelStreamKind::Session => {
+                                                    // Keep stderr separate so tools like Zed can use stdout as a clean transport.
+                                                    if handle
+                                                        .extended_data(
+                                                            channel_id,
+                                                            1, // SSH_EXTENDED_DATA_STDERR
+                                                            CryptoVec::from_slice(message.as_ref()),
+                                                        )
+                                                        .await
+                                                        .is_err()
+                                                    {
+                                                        break;
+                                                    }
+                                                }
+                                                ChannelStreamKind::TcpForward => {
+                                                    // For TCP forwarding channels, do not send stderr as it would corrupt the byte stream.
+                                                    // Log it server-side instead.
+                                                    warn!(
+                                                        "tcp-forward stderr (ignored): {}",
+                                                        String::from_utf8_lossy(message.as_ref())
+                                                    );
+                                                }
                                             }
                                         }
                                         LogOutput::StdOut { message }
@@ -1000,29 +1009,31 @@ impl ConnectionHandler {
                             }
                         }
 
-                        // Capture exit status for clients (editors) that rely on it.
-                        // `inspect_exec` may briefly report Running=true even after the output stream ends,
-                        // so we poll for a short time.
-                        let mut exit_status: u32 = 255;
-                        for _ in 0..80 {
-                            match docker.inspect_exec(&exec_id).await {
-                                Ok(info) => {
-                                    if info.running.unwrap_or(false) {
-                                        tokio::time::sleep(Duration::from_millis(25)).await;
-                                        continue;
+                        if kind == ChannelStreamKind::Session {
+                            // Capture exit status for clients (editors) that rely on it.
+                            // `inspect_exec` may briefly report Running=true even after the output stream ends,
+                            // so we poll for a short time.
+                            let mut exit_status: u32 = 255;
+                            for _ in 0..80 {
+                                match docker.inspect_exec(&exec_id).await {
+                                    Ok(info) => {
+                                        if info.running.unwrap_or(false) {
+                                            tokio::time::sleep(Duration::from_millis(25)).await;
+                                            continue;
+                                        }
+                                        let code = info.exit_code.unwrap_or(0);
+                                        exit_status = if code < 0 { 255 } else { code as u32 };
+                                        break;
                                     }
-                                    let code = info.exit_code.unwrap_or(0);
-                                    exit_status = if code < 0 { 255 } else { code as u32 };
-                                    break;
-                                }
-                                Err(e) => {
-                                    warn!("Failed to inspect exec {}: {}", exec_id, e);
-                                    break;
+                                    Err(e) => {
+                                        warn!("Failed to inspect exec {}: {}", exec_id, e);
+                                        break;
+                                    }
                                 }
                             }
-                        }
 
-                        let _ = handle.exit_status_request(channel_id, exit_status).await;
+                            let _ = handle.exit_status_request(channel_id, exit_status).await;
+                        }
 
                         // Send EOF and close
                         let _ = handle.eof(channel_id).await;
