@@ -275,4 +275,6 @@ USER ${USERNAME}
 # Set tini as entrypoint for proper signal handling.
 # Use custom entrypoint that sets up SSH
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
-CMD ["opencode"]
+# CMD ["opencode"]
+
+CMD ["sleep", "infinity"]
