@@ -169,13 +169,25 @@ RUN arch="$(dpkg --print-architecture)" \
  && rm -rf "${tmpdir}" /tmp/opencode.tar.gz \
  && opencode --version || true
 
-# --- Non-root user ---
+# --- SSH Server Setup (as root) ---
+RUN mkdir -p /var/run/sshd \
+ && sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config \
+ && sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config \
+ && sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config \
+ && echo "AllowUsers ${USERNAME}" >> /etc/ssh/sshd_config \
+ && echo "Port 22" >> /etc/ssh/sshd_config
+
+# --- Non-root user with root privileges ---
 RUN groupadd --gid "${USER_GID}" "${USERNAME}" \
  && useradd --uid "${USER_UID}" --gid "${USER_GID}" --create-home --shell /bin/bash "${USERNAME}" \
+ && usermod -aG sudo "${USERNAME}" \
  && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" >"/etc/sudoers.d/${USERNAME}" \
  && chmod 0440 "/etc/sudoers.d/${USERNAME}" \
  && mkdir -p /workspace \
- && chown -R "${USERNAME}:${USERNAME}" /workspace
+ && chown -R "${USERNAME}:${USERNAME}" /workspace \
+ && mkdir -p /home/${USERNAME}/.ssh \
+ && chmod 700 /home/${USERNAME}/.ssh \
+ && chown -R "${USERNAME}:${USERNAME}" /home/${USERNAME}/.ssh
 
 USER ${USERNAME}
 WORKDIR /workspace
@@ -250,8 +262,17 @@ RUN mkdir -p "${SDKMAN_DIR}/var" \
 RUN printf '\n# Agent toolchain paths\nexport GOPATH=\"$HOME/go\"\nexport PATH=\"$HOME/.cargo/bin:$HOME/.local/bin:$GOPATH/bin:/usr/local/go/bin:/usr/local/bun/bin:$PATH\"\n\n# SDKMAN\nexport SDKMAN_DIR=\"$HOME/.sdkman\"\n[[ -s \"$SDKMAN_DIR/bin/sdkman-init.sh\" ]] && source \"$SDKMAN_DIR/bin/sdkman-init.sh\"\n' \
  | tee -a "${HOME}/.bashrc" "${HOME}/.profile" >/dev/null
 
+# Copy scripts (switch to root temporarily for installation)
+USER root
+COPY scripts/setup-ssh-keys.sh /usr/local/bin/setup-ssh-keys.sh
+COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/setup-ssh-keys.sh /usr/local/bin/docker-entrypoint.sh \
+ && chown root:root /usr/local/bin/setup-ssh-keys.sh /usr/local/bin/docker-entrypoint.sh
+
 COPY AGENTS.md .
+USER ${USERNAME}
 
 # Set tini as entrypoint for proper signal handling.
-ENTRYPOINT ["/usr/bin/tini", "--"]
+# Use custom entrypoint that sets up SSH
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
 CMD ["opencode"]
