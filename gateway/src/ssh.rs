@@ -86,6 +86,19 @@ struct PtyInfo {
     rows: u32,
 }
 
+fn exec_env(tty: bool, term: &str) -> Vec<String> {
+    // Keep this small and non-invasive:
+    // - Zed (and other editors) probe `$SHELL` over non-PTY exec sessions.
+    // - Some clients run `cd; ...` which fails if HOME is missing.
+    let mut env = vec!["SHELL=/bin/bash".to_string()];
+    if tty {
+        env.push(format!("TERM={}", term));
+    } else {
+        env.push("HOME=/workspace".to_string());
+    }
+    env
+}
+
 impl ConnectionHandler {
     fn new(server: Arc<ServerState>, peer_addr: SocketAddr) -> Self {
         Self {
@@ -389,7 +402,7 @@ impl Handler for ConnectionHandler {
         _pix_width: u32,
         _pix_height: u32,
         _modes: &[(russh::Pty, u32)],
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
         debug!(
             "PTY request: channel={:?}, term={}, cols={}, rows={}",
@@ -405,6 +418,8 @@ impl Handler for ConnectionHandler {
                 rows: row_height,
             },
         );
+        // Client requested a PTY; confirm success.
+        session.channel_success(channel_id)?;
         Ok(())
     }
 
@@ -440,7 +455,7 @@ impl Handler for ConnectionHandler {
         };
 
         let cmd = match self.server.config.shell.mode {
-            ShellMode::Bash => vec!["bash".to_string(), "-l".to_string()],
+            ShellMode::Bash => vec!["/bin/bash".to_string(), "-l".to_string()],
             ShellMode::Tmux => {
                 // Only start tmux when the client requested a PTY (true interactive session).
                 // This avoids breaking editor/bootstrap flows that use non-PTY sessions.
@@ -448,12 +463,12 @@ impl Handler for ConnectionHandler {
                     let session_name =
                         sanitize_tmux_session_name(&self.server.config.shell.tmux_session);
                     let script = format!(
-                        "if command -v tmux >/dev/null 2>&1; then exec tmux new-session -A -s '{session}' -c /workspace bash -l; else exec bash -l; fi",
+                        "if command -v tmux >/dev/null 2>&1; then exec tmux new-session -A -s '{session}' -c /workspace /bin/bash -l; else exec /bin/bash -l; fi",
                         session = session_name
                     );
-                    vec!["bash".to_string(), "-lc".to_string(), script]
+                    vec!["/bin/bash".to_string(), "-lc".to_string(), script]
                 } else {
-                    vec!["bash".to_string(), "-l".to_string()]
+                    vec!["/bin/bash".to_string(), "-l".to_string()]
                 }
             }
         };
@@ -466,13 +481,16 @@ impl Handler for ConnectionHandler {
                 &container_id,
                 cmd,
                 tty,
-                tty.then(|| vec![format!("TERM={}", term)]),
+                Some(exec_env(tty, term)),
             )
             .await?;
 
         // Start exec and connect to channel
         self.start_exec_session(channel_id, exec_id.clone(), tty, session)
             .await?;
+
+        // Confirm the shell request was accepted (client may be waiting on this).
+        session.channel_success(channel_id)?;
 
         // Resize to stored PTY dimensions
         if let Some(pty) = self.ptys.get(&channel_id) {
@@ -530,15 +548,18 @@ impl Handler for ConnectionHandler {
                 &container_id,
                 // Exec requests should behave like standard sshd: don't force a login shell.
                 // This avoids user rc files (e.g. tmux auto-attach) breaking editor bootstrap flows.
-                vec!["bash".to_string(), "-c".to_string(), command],
+                vec!["/bin/bash".to_string(), "-c".to_string(), command],
                 tty,
-                tty.then(|| vec![format!("TERM={}", term)]),
+                Some(exec_env(tty, term)),
             )
             .await?;
 
         // Start exec and connect to channel
         self.start_exec_session(channel_id, exec_id.clone(), tty, session)
             .await?;
+
+        // Confirm the exec request was accepted (OpenSSH sets want-reply=true).
+        session.channel_success(channel_id)?;
 
         // Resize to stored PTY dimensions
         if let Some(pty) = self.ptys.get(&channel_id) {
@@ -898,7 +919,7 @@ impl ConnectionHandler {
         tty: bool,
         session: &mut Session,
     ) -> Result<()> {
-        let _docker = self.server.container_manager.docker().clone();
+        let docker = self.server.container_manager.docker().clone();
 
         // Start the exec
         let results = self
@@ -927,7 +948,7 @@ impl ConnectionHandler {
             match results {
                 StartExecResults::Attached { mut output, mut input } => {
                     // Task to forward stdin to container
-                    let stdin_task = async {
+                    let stdin_task = async move {
                         while let Some(data) = stdin_rx.recv().await {
                             if input.write_all(&data).await.is_err() {
                                 break;
@@ -936,7 +957,7 @@ impl ConnectionHandler {
                     };
 
                     // Task to forward container output to SSH channel
-                    let stdout_task = async {
+                    let stdout_task = async move {
                         while let Some(output_result) = output.next().await {
                             match output_result {
                                 Ok(output) => {
@@ -955,15 +976,40 @@ impl ConnectionHandler {
                                 }
                             }
                         }
+
+                        // Capture exit status for clients (editors) that rely on it.
+                        // `inspect_exec` may briefly report Running=true even after the output stream ends,
+                        // so we poll for a short time.
+                        let mut exit_status: u32 = 255;
+                        for _ in 0..80 {
+                            match docker.inspect_exec(&exec_id).await {
+                                Ok(info) => {
+                                    if info.running.unwrap_or(false) {
+                                        tokio::time::sleep(Duration::from_millis(25)).await;
+                                        continue;
+                                    }
+                                    let code = info.exit_code.unwrap_or(0);
+                                    exit_status = if code < 0 { 255 } else { code as u32 };
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!("Failed to inspect exec {}: {}", exec_id, e);
+                                    break;
+                                }
+                            }
+                        }
+
+                        let _ = handle.exit_status_request(channel_id, exit_status).await;
+
                         // Send EOF and close
                         let _ = handle.eof(channel_id).await;
                         let _ = handle.close(channel_id).await;
                     };
 
-                    tokio::select! {
-                        _ = stdin_task => {}
-                        _ = stdout_task => {}
-                    }
+                    // Keep forwarding stdout even if the client closes stdin early (common for `ssh -T ... cmd`).
+                    let stdin_handle = tokio::spawn(stdin_task);
+                    stdout_task.await;
+                    stdin_handle.abort();
                 }
                 StartExecResults::Detached => {
                     warn!("Exec started in detached mode unexpectedly");

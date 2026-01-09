@@ -88,6 +88,8 @@ ssh myproject+octocat@gateway
 ```
 The `+octocat` tells the gateway your GitHub username. It verifies your SSH key is in `github.com/octocat.keys` and caches the mapping.
 
+Note: editor integrations typically run non-PTY SSH exec probes (e.g. `ssh -T host "cd; uname -sm"`). The gateway does **not** wrap these in tmux and returns a proper SSH exit status so editors can bootstrap reliably.
+
 **Interactive (first time from terminal)**:
 ```bash
 ssh myproject@gateway
@@ -212,6 +214,8 @@ The workspace is bind-mounted to `/workspace` inside the container. This persist
 - Container restarts
 - New container creation (e.g., after image updates)
 - Gateway restarts
+
+**Permissions note (important for Zed/VS Code Remote SSH):** the gateway bind-mounts a host directory into `/workspace`. The container runs as a non-root user (UID/GID **1000** by default), so the host workspace directory must be writable by that user. The gateway will attempt to `chown`/`chmod` the workspace directory automatically; if you run the gateway without permission to do that, fix it on the host (or set `workspace_root` to a location with correct ownership).
 
 ---
 

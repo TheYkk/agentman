@@ -19,10 +19,102 @@ use chrono::Utc;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use tokio::process::Command;
 use tracing::{info, warn};
 
 use crate::config::GatewayConfig;
 use crate::state::{StateManager, WorkspaceInfo};
+
+#[cfg(unix)]
+async fn ensure_workspace_writable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    // This matches the default user baked into the base image (see Dockerfile: USER_UID/USER_GID).
+    // If you run a custom image with a different UID/GID, you may need to adjust this logic.
+    const CONTAINER_UID: u32 = 1000;
+    const CONTAINER_GID: u32 = 1000;
+
+    // Ensure directory exists.
+    tokio::fs::create_dir_all(path)
+        .await
+        .with_context(|| format!("Failed to create workspace directory: {}", path.display()))?;
+
+    let md = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("Failed to stat workspace directory: {}", path.display()))?;
+    let mode = md.permissions().mode() & 0o777;
+
+    // Check whether UID 1000 can write to this directory with current ownership/mode.
+    let writable = if md.uid() == CONTAINER_UID {
+        (mode & 0o200 != 0) && (mode & 0o100 != 0)
+    } else if md.gid() == CONTAINER_GID {
+        (mode & 0o020 != 0) && (mode & 0o010 != 0)
+    } else {
+        (mode & 0o002 != 0) && (mode & 0o001 != 0)
+    };
+    if writable {
+        return Ok(());
+    }
+
+    // Try to fix ownership and mode. This will succeed when the gateway runs as root.
+    // We do NOT do recursive chown to avoid expensive walks on large workspaces.
+    // The key requirement for editor bootstraps is that the workspace root is writable.
+    match Command::new("chown")
+        .arg(format!("{CONTAINER_UID}:{CONTAINER_GID}"))
+        .arg(path)
+        .status()
+        .await
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => warn!(
+            "chown {}:{} {} exited with status {}",
+            CONTAINER_UID,
+            CONTAINER_GID,
+            path.display(),
+            status
+        ),
+        Err(e) => warn!(
+            "Failed to run chown {}:{} {}: {}",
+            CONTAINER_UID,
+            CONTAINER_GID,
+            path.display(),
+            e
+        ),
+    }
+
+    // Prefer 0775 (not world-writable) after chown.
+    let _ = tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o775)).await;
+
+    // If it’s still not writable, fall back to 0777 (best-effort to make editors work).
+    let md2 = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("Failed to stat workspace directory: {}", path.display()))?;
+    let mode2 = md2.permissions().mode() & 0o777;
+    let writable2 = if md2.uid() == CONTAINER_UID {
+        (mode2 & 0o200 != 0) && (mode2 & 0o100 != 0)
+    } else if md2.gid() == CONTAINER_GID {
+        (mode2 & 0o020 != 0) && (mode2 & 0o010 != 0)
+    } else {
+        (mode2 & 0o002 != 0) && (mode2 & 0o001 != 0)
+    };
+    if !writable2 {
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to chmod workspace directory to be writable: {}",
+                    path.display()
+                )
+            })?;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn ensure_workspace_writable(_path: &Path) -> Result<()> {
+    Ok(())
+}
 
 /// Docker container manager.
 pub struct ContainerManager {
@@ -60,6 +152,10 @@ impl ContainerManager {
         github_user: &str,
         project: &str,
     ) -> Result<String> {
+        // Ensure the host workspace directory is writable by the container user (needed for Zed/VS Code bootstraps).
+        let workspace_path = self.config.workspace_path(github_user, project);
+        ensure_workspace_writable(&workspace_path).await?;
+
         // Check if we already have a container for this workspace
         if let Some(workspace) = self.state.get_workspace(github_user, project).await {
             // Check if container still exists and is usable
@@ -97,14 +193,7 @@ impl ContainerManager {
 
         // Ensure workspace directory exists
         let workspace_path = self.config.workspace_path(github_user, project);
-        tokio::fs::create_dir_all(&workspace_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to create workspace directory: {}",
-                    workspace_path.display()
-                )
-            })?;
+        ensure_workspace_writable(&workspace_path).await?;
 
         // Build container configuration
         let host_config = self.build_host_config(&workspace_path)?;
