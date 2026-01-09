@@ -8,6 +8,7 @@ use bollard::query_parameters::{
     InspectContainerOptions, StatsOptionsBuilder, StopContainerOptionsBuilder,
 };
 use crate::docker::{ContainerManager, DestroyOptions};
+use chrono::DateTime;
 use futures::StreamExt;
 use std::path::Path;
 use tokio::process::Command;
@@ -489,10 +490,13 @@ async fn container_stats_line(
     let docker = container_manager.docker();
     let mut stream = docker.stats(
         container_name,
-        Some(StatsOptionsBuilder::new().stream(false).one_shot(true).build()),
+        // Equivalent to `docker stats --no-stream`: the daemon waits for two samples so it can
+        // populate `precpu_stats` for CPU% calculation.
+        Some(StatsOptionsBuilder::new().stream(false).build()),
     );
 
-    let next = timeout(Duration::from_secs(2), stream.next()).await.ok()??;
+    // The daemon may wait for two cycles before returning the single response.
+    let next = timeout(Duration::from_secs(5), stream.next()).await.ok()??;
     let stats = next.ok()?;
 
     let cpu_stats = stats.cpu_stats.as_ref()?;
@@ -516,12 +520,35 @@ async fn container_stats_line(
     let online_cpus = cpu_stats
         .online_cpus
         .map(|n| n as u64)
-        .unwrap_or(percpu_count);
+        .filter(|&n| n > 0)
+        .unwrap_or(percpu_count.max(1));
 
-    let cpu_percent = if system_delta > 0 && cpu_delta > 0 {
+    // Prefer Docker's standard calculation when system CPU usage deltas are available.
+    // Some engines / cgroup modes can omit or zero out system usage, so fall back to using the
+    // daemon-provided timestamps.
+    let cpu_percent = if cpu_delta == 0 {
+        0.0
+    } else if system_delta > 0 {
         (cpu_delta as f64 / system_delta as f64) * online_cpus as f64 * 100.0
     } else {
-        0.0
+        match (stats.read.as_deref(), stats.preread.as_deref()) {
+            (Some(read), Some(preread)) => {
+                let read_ns = DateTime::parse_from_rfc3339(read)
+                    .ok()
+                    .and_then(|dt| dt.timestamp_nanos_opt());
+                let preread_ns = DateTime::parse_from_rfc3339(preread)
+                    .ok()
+                    .and_then(|dt| dt.timestamp_nanos_opt());
+                match (read_ns, preread_ns) {
+                    (Some(r), Some(p)) if r > p => {
+                        let dt_ns = (r - p) as f64;
+                        (cpu_delta as f64 / dt_ns) * 100.0
+                    }
+                    _ => 0.0,
+                }
+            }
+            _ => 0.0,
+        }
     };
 
     let mem = stats.memory_stats.as_ref().and_then(|m| match (m.usage, m.limit) {
