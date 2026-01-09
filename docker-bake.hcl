@@ -19,6 +19,7 @@ variable "GO_VERSION"    { default = "1.25.5" }
 variable "BUN_VERSION"   { default = "1.3.5" }
 variable "UV_VERSION"    { default = "0.9.22" }
 variable "PYTHON_VERSION" { default = "3.13" }
+variable "DUCKDB_VERSION" { default = "1.4.3" }
 variable "OPENCODE_VERSION" { default = "v1.1.7" }
 
 variable "USERNAME"      { default = "agent" }
@@ -44,6 +45,7 @@ target "agentman" {
     BUN_VERSION      = "${BUN_VERSION}"
     UV_VERSION       = "${UV_VERSION}"
     PYTHON_VERSION   = "${PYTHON_VERSION}"
+    DUCKDB_VERSION   = "${DUCKDB_VERSION}"
     OPENCODE_VERSION = "${OPENCODE_VERSION}"
 
     USERNAME         = "${USERNAME}"

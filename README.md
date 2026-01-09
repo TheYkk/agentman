@@ -5,6 +5,7 @@ Debian-based base image for a coding agent with pinned versions of:
 - **Go**
 - **Bun**
 - **uv** + **Python** installed via `uv python install`
+- **DuckDB** (CLI)
 - **opencode** (default command under `tini`)
 
 Python is installed using uv per the official guide: `https://docs.astral.sh/uv/guides/install-python/`.
@@ -15,7 +16,7 @@ Python is installed using uv per the official guide: `https://docs.astral.sh/uv/
 
 Edit `docker/versions.env`:
 - **Base image**: `DEBIAN_TAG`
-- **Tools**: `RUSTUP_VERSION`, `RUST_TOOLCHAIN`, `GO_VERSION`, `BUN_VERSION`, `UV_VERSION`, `PYTHON_VERSION`, `OPENCODE_VERSION`
+- **Tools**: `RUSTUP_VERSION`, `RUST_TOOLCHAIN`, `GO_VERSION`, `BUN_VERSION`, `UV_VERSION`, `PYTHON_VERSION`, `DUCKDB_VERSION`, `OPENCODE_VERSION`
 - **User**: `USERNAME`, `USER_UID`, `USER_GID`
 
 ## Build (local)

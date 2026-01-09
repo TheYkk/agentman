@@ -14,6 +14,7 @@ ARG GO_VERSION=1.25.5
 ARG BUN_VERSION=1.3.5
 ARG UV_VERSION=0.9.22
 ARG PYTHON_VERSION=3.13
+ARG DUCKDB_VERSION=1.4.3
 ARG OPENCODE_VERSION=v1.1.7
 
 # User config
@@ -33,6 +34,11 @@ RUN apt-get update \
       wget \
       git \
       jq \
+      grep \
+      gawk \
+      sed \
+      findutils \
+      coreutils \
       openssh-client \
       openssh-server \
       sudo \
@@ -69,7 +75,12 @@ RUN apt-get update \
       vim \
       xz-utils \
       zip \
+      docker.io \
+      postgresql-client \
+      default-mysql-client \
+      python3 \
       python3-pip \
+      python3-venv \
       python-is-python3 \
       pipx \
  && rm -rf /var/lib/apt/lists/*
@@ -82,6 +93,20 @@ RUN apt-get update \
       apt-get install -y --no-install-recommends bsdextrautils; \
     fi \
  && rm -rf /var/lib/apt/lists/*
+
+# --- DuckDB CLI (pinned) ---
+RUN arch="$(dpkg --print-architecture)" \
+ && case "${arch}" in \
+      amd64) duck_arch="amd64" ;; \
+      arm64) duck_arch="arm64" ;; \
+      *) echo "Unsupported dpkg architecture: ${arch}" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL -o /tmp/duckdb.zip "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-linux-${duck_arch}.zip" \
+ && mkdir -p /tmp/duckdb \
+ && unzip -q /tmp/duckdb.zip -d /tmp/duckdb \
+ && install -m 0755 /tmp/duckdb/duckdb /usr/local/bin/duckdb \
+ && rm -rf /tmp/duckdb /tmp/duckdb.zip \
+ && duckdb --version
 
 SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 
@@ -151,7 +176,6 @@ RUN groupadd --gid "${USER_GID}" "${USERNAME}" \
 
 USER ${USERNAME}
 WORKDIR /workspace
-
 ENV HOME=/home/${USERNAME} \
     GOPATH=/home/${USERNAME}/go \
     PATH=/home/${USERNAME}/.cargo/bin:/home/${USERNAME}/.local/bin:/home/${USERNAME}/go/bin:/usr/local/go/bin:/usr/local/bun/bin:${PATH}
@@ -163,7 +187,7 @@ RUN arch="$(dpkg --print-architecture)" \
       arm64) rustup_triple="aarch64-unknown-linux-gnu" ;; \
       *) echo "Unsupported dpkg architecture: ${arch}" >&2; exit 1 ;; \
     esac \
- && curl -fsSL -o /tmp/rustup-init "https://github.com/rust-lang/rustup/releases/download/${RUSTUP_VERSION}/rustup-init-${rustup_triple}" \
+ && curl -fsSL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${rustup_triple}/rustup-init" \
  && chmod +x /tmp/rustup-init \
  && /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain "${RUST_TOOLCHAIN}" \
  && rm -f /tmp/rustup-init \
@@ -178,6 +202,8 @@ RUN uv python install "${PYTHON_VERSION}" --default \
  && python --version \
  && python3 --version \
  && uv python list
+
+COPY AGENTS.md .
 
 # Set tini as entrypoint for proper signal handling.
 ENTRYPOINT ["/usr/bin/tini", "--"]
