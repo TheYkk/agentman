@@ -568,8 +568,15 @@ impl Handler for ConnectionHandler {
             match res {
                 GatewayControlExecution::Immediate { exit_status, output } => {
                     if !output.is_empty() {
+                        // Use CRLF when PTY is allocated (ssh -t) for proper line display.
+                        let has_pty = self.ptys.contains_key(&channel_id);
+                        let data = if has_pty {
+                            output.replace('\n', "\r\n")
+                        } else {
+                            output
+                        };
                         let _ = handle
-                            .data(channel_id, CryptoVec::from_slice(output.as_bytes()))
+                            .data(channel_id, CryptoVec::from_slice(data.as_bytes()))
                             .await;
                     }
                     let _ = handle.exit_status_request(channel_id, exit_status).await;
