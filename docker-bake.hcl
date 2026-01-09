@@ -28,15 +28,21 @@ variable "USERNAME"      { default = "agent" }
 variable "USER_UID"      { default = "1000" }
 variable "USER_GID"      { default = "1000" }
 
+// Used by docker/metadata-action to inject tags/labels via an additional bake file.
+// Local builds fall back to IMAGE_NAME:IMAGE_TAG here.
+target "docker-metadata-action" {
+  tags = ["${IMAGE_NAME}:${IMAGE_TAG}"]
+}
+
 group "default" {
   targets = ["agentman"]
 }
 
 target "agentman" {
+  inherits = ["docker-metadata-action"]
   context    = "."
   dockerfile = "Dockerfile"
 
-  tags = ["${IMAGE_NAME}:${IMAGE_TAG}"]
   platforms = [for p in split(",", PLATFORMS) : trimspace(p)]
 
   args = {
