@@ -5,6 +5,7 @@
 
 mod config;
 mod docker;
+mod gateway_control;
 mod github;
 mod ssh;
 mod state;
