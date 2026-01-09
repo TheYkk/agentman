@@ -143,6 +143,10 @@ impl StateManager {
     }
 
     /// Update container ID for an existing workspace.
+    ///
+    /// Not currently used directly (workspaces are typically rewritten via `set_workspace`),
+    /// but kept as a focused helper for future lifecycle commands.
+    #[allow(dead_code)]
     pub async fn update_container_id(
         &self,
         github_user: &str,
@@ -171,6 +175,9 @@ impl StateManager {
     }
 
     /// List all known GitHub users (from key cache).
+    ///
+    /// Reserved for future admin/diagnostic commands.
+    #[allow(dead_code)]
     pub async fn list_github_users(&self) -> Vec<String> {
         let state = self.state.read().await;
         state

@@ -236,6 +236,35 @@ Preview what would be deleted:
 ssh myproject@gateway agentman destroy --dry-run
 ```
 
+### Sandbox Control (List / Stop / Pause / Stats)
+
+List all sandboxes for your GitHub user:
+```bash
+ssh myproject@gateway agentman list
+```
+
+Stop the **current** sandbox container (keeps the persisted workspace data on disk):
+```bash
+ssh myproject@gateway agentman stop
+```
+
+Pause the **current** sandbox container:
+```bash
+ssh myproject@gateway agentman pause
+```
+
+Show CPU/memory and **persisted workspace storage** stats for **all** your sandboxes:
+```bash
+ssh myproject@gateway agentman stats
+```
+
+Show stats only for the **current** sandbox:
+```bash
+ssh myproject@gateway agentman stats --current
+```
+
+Note: `agentman exec <cmd>` is accepted as an alias (e.g. `agentman exec stats --current`).
+
 ---
 
 ## Base Image

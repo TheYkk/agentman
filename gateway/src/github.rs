@@ -124,6 +124,10 @@ pub fn parse_ssh_key(key: &str) -> Result<(String, String)> {
 /// Compute the SHA256 fingerprint of an SSH public key.
 ///
 /// Returns the fingerprint in "SHA256:..." format used by `ssh-keygen -l`.
+///
+/// Note: the gateway currently uses `compute_fingerprint_from_pubkey` for the auth flow, but this
+/// helper is useful when working with OpenSSH-formatted public key strings.
+#[allow(dead_code)]
 pub fn compute_fingerprint(public_key: &str) -> Result<String> {
     let (_, key_data) = parse_ssh_key(public_key)?;
     let decoded = base64::engine::general_purpose::STANDARD

@@ -7,14 +7,12 @@
 //! - Container lifecycle (start, stop, exec)
 
 use anyhow::{anyhow, Context, Result};
-use bollard::container::{
-    Config, CreateContainerOptions,
-    StartContainerOptions, InspectContainerOptions,
-    ListContainersOptions,
-    StopContainerOptions, RemoveContainerOptions,
+use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecOptions, StartExecResults};
+use bollard::models::{ContainerCreateBody, HostConfig};
+use bollard::query_parameters::{
+    CreateContainerOptionsBuilder, InspectContainerOptions, ListContainersOptionsBuilder,
+    RemoveContainerOptionsBuilder, StartContainerOptions, StopContainerOptionsBuilder,
 };
-use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults, ResizeExecOptions};
-use bollard::models::HostConfig;
 use bollard::Docker;
 use chrono::Utc;
 use std::collections::HashMap;
@@ -268,7 +266,7 @@ impl ContainerManager {
         let host_config = self.build_host_config(&workspace_path)?;
         let env = self.build_env(github_user, project, &container_name);
 
-        let config = Config {
+        let config = ContainerCreateBody {
             image: Some(self.config.docker_image.clone()),
             hostname: Some(container_name.clone()),
             env: Some(env),
@@ -283,10 +281,9 @@ impl ContainerManager {
             ..Default::default()
         };
 
-        let options = CreateContainerOptions {
-            name: container_name.clone(),
-            platform: None,
-        };
+        let options = CreateContainerOptionsBuilder::new()
+            .name(&container_name)
+            .build();
 
         let response = self
             .docker
@@ -299,7 +296,7 @@ impl ContainerManager {
 
         // Start the container
         self.docker
-            .start_container(&container_id, None::<StartContainerOptions<String>>)
+            .start_container(&container_id, None::<StartContainerOptions>)
             .await
             .with_context(|| format!("Failed to start container {}", container_name))?;
 
@@ -408,11 +405,10 @@ impl ContainerManager {
                 vec![format!("^{}$", name)],
             )]);
 
-            let options = ListContainersOptions {
-                all: true,
-                filters,
-                ..Default::default()
-            };
+            let options = ListContainersOptionsBuilder::new()
+                .all(true)
+                .filters(&filters)
+                .build();
 
             let containers = self
                 .docker
@@ -461,11 +457,26 @@ impl ContainerManager {
             .as_ref()
             .and_then(|s| s.running)
             .unwrap_or(false);
+        let paused = info
+            .state
+            .as_ref()
+            .and_then(|s| s.paused)
+            .unwrap_or(false);
+
+        // If a container is paused, it will appear "running" but exec will be unusable.
+        // Unpause it so users can reconnect cleanly.
+        if paused {
+            info!("Unpausing paused container {}", container_id);
+            self.docker
+                .unpause_container(container_id)
+                .await
+                .context("Failed to unpause container")?;
+        }
 
         if !running {
             info!("Starting stopped container {}", container_id);
             self.docker
-                .start_container(container_id, None::<StartContainerOptions<String>>)
+                .start_container(container_id, None::<StartContainerOptions>)
                 .await
                 .context("Failed to start container")?;
         }
@@ -473,7 +484,20 @@ impl ContainerManager {
         Ok(())
     }
 
+    /// List all workspaces for a given GitHub user.
+    pub async fn list_workspaces(&self, github_user: &str) -> Vec<WorkspaceInfo> {
+        self.state.list_workspaces(github_user).await
+    }
+
+    /// Get workspace info by (github_user, project).
+    pub async fn get_workspace(&self, github_user: &str, project: &str) -> Option<WorkspaceInfo> {
+        self.state.get_workspace(github_user, project).await
+    }
+
     /// Get the container's IP address on the bridge network.
+    ///
+    /// Not currently used in the gateway, but kept for future port-forwarding / networking features.
+    #[allow(dead_code)]
     pub async fn get_container_ip(&self, container_id: &str) -> Result<String> {
         let info = self
             .docker
@@ -615,7 +639,10 @@ impl ContainerManager {
             if !opts.force {
                 match self
                     .docker
-                    .stop_container(&target, Some(StopContainerOptions { t: 10 }))
+                    .stop_container(
+                        &target,
+                        Some(StopContainerOptionsBuilder::new().t(10).build()),
+                    )
                     .await
                 {
                     Ok(_) => {}
@@ -630,11 +657,11 @@ impl ContainerManager {
                 }
             }
 
-            let rm_opts = RemoveContainerOptions {
-                force: opts.force,
-                v: true,
-                link: false,
-            };
+            let rm_opts = RemoveContainerOptionsBuilder::new()
+                .force(opts.force)
+                .v(true)
+                .link(false)
+                .build();
 
             match self.docker.remove_container(&target, Some(rm_opts)).await {
                 Ok(_) => {
@@ -700,11 +727,10 @@ impl ContainerManager {
             vec!["agentman.managed=true".to_string()],
         )]);
 
-        let options = ListContainersOptions {
-            all: true,
-            filters,
-            ..Default::default()
-        };
+        let options = ListContainersOptionsBuilder::new()
+            .all(true)
+            .filters(&filters)
+            .build();
 
         let containers = self
             .docker
