@@ -25,7 +25,7 @@ use tracing::{debug, info, warn};
 use crate::config::GatewayConfig;
 use crate::docker::ContainerManager;
 use crate::github::{
-    compute_fingerprint_from_bytes, parse_ssh_username, public_key_to_openssh,
+    compute_fingerprint_from_pubkey, parse_ssh_username, public_key_to_openssh,
     validate_github_username, validate_project_name, GitHubKeyFetcher,
 };
 use crate::state::{KeyCacheEntry, StateManager};
@@ -63,6 +63,16 @@ pub struct ConnectionHandler {
 
     /// Active remote port forwards (bind_addr -> listener task handle).
     remote_forwards: HashMap<(String, u32), tokio::task::JoinHandle<()>>,
+
+    /// All public key fingerprints offered during this auth session.
+    /// We cache all of them once GitHub verification succeeds.
+    offered_key_fingerprints: Vec<String>,
+
+    /// PTY dimensions (cols, rows) from pty_request.
+    pty_size: Option<(u32, u32)>,
+
+    /// Terminal type from pty_request.
+    term: Option<String>,
 }
 
 struct ExecSession {
@@ -82,6 +92,9 @@ impl ConnectionHandler {
             exec_sessions: HashMap::new(),
             pending_github_user: None,
             remote_forwards: HashMap::new(),
+            offered_key_fingerprints: Vec::new(),
+            pty_size: None,
+            term: None,
         }
     }
 }
@@ -122,10 +135,13 @@ impl Handler for ConnectionHandler {
         self.project = Some(project.clone());
 
         // Get key fingerprint
-        use russh::keys::PublicKeyBase64;
-        let key_str = public_key.public_key_base64();
-        let fingerprint = compute_fingerprint_from_bytes(key_str.as_bytes());
+        let fingerprint = compute_fingerprint_from_pubkey(public_key);
         debug!("Key fingerprint: {}", fingerprint);
+
+        // Track all offered keys so we can cache them all once verified
+        if !self.offered_key_fingerprints.contains(&fingerprint) {
+            self.offered_key_fingerprints.push(fingerprint.clone());
+        }
 
         // Check if we have this key cached
         if let Some(cached) = self.server.state.get_github_user(&fingerprint).await {
@@ -143,14 +159,12 @@ impl Handler for ConnectionHandler {
         if let Some(ref github_user) = self.pending_github_user {
             debug!("Verifying key against pending GitHub user '{}'", github_user);
             
-            let key_str = public_key_to_openssh(public_key);
-            let key_type = key_str.split_whitespace().next().unwrap_or("unknown");
-            let full_key = format!("{} {}", key_type, key_str);
+            let openssh_key = public_key_to_openssh(public_key);
 
             match self
                 .server
                 .github_fetcher
-                .verify_key(github_user, &full_key)
+                .verify_key(github_user, &openssh_key)
                 .await
             {
                 Ok(verified_type) => {
@@ -159,30 +173,21 @@ impl Handler for ConnectionHandler {
                         github_user, verified_type
                     );
 
-                    // Cache the key
-                    let entry = KeyCacheEntry {
-                        github_username: github_user.clone(),
-                        verified_at: Utc::now(),
-                        key_type: verified_type,
-                    };
-                    if let Err(e) = self
-                        .server
-                        .state
-                        .cache_key(fingerprint.clone(), entry)
-                        .await
-                    {
-                        warn!("Failed to cache key: {}", e);
-                    }
+                    // Cache ALL offered keys for this GitHub user, not just the verified one
+                    self.cache_all_offered_keys(github_user, &verified_type).await;
 
                     self.github_user = Some(github_user.clone());
                     self.pending_github_user = None;
                     return Ok(Auth::Accept);
                 }
                 Err(e) => {
-                    warn!("Failed to verify key for '{}': {}", github_user, e);
-                    // Key didn't match - clear pending and ask again
-                    self.pending_github_user = None;
-                    let methods = MethodSet::from(&[MethodKind::KeyboardInteractive][..]);
+                    warn!(
+                        "Key did not match GitHub user '{}': {}. Trying other keys.",
+                        github_user, e
+                    );
+                    // Keep publickey enabled so the client can try another key without re-prompting.
+                    let methods =
+                        MethodSet::from(&[MethodKind::PublicKey, MethodKind::KeyboardInteractive][..]);
                     return Ok(Auth::Reject {
                         proceed_with_methods: Some(methods),
                         partial_success: false,
@@ -201,14 +206,12 @@ impl Handler for ConnectionHandler {
                 });
             }
 
-            let key_str = public_key_to_openssh(public_key);
-            let key_type = key_str.split_whitespace().next().unwrap_or("unknown");
-            let full_key = format!("{} {}", key_type, key_str);
+            let openssh_key = public_key_to_openssh(public_key);
 
             match self
                 .server
                 .github_fetcher
-                .verify_key(&github_user, &full_key)
+                .verify_key(&github_user, &openssh_key)
                 .await
             {
                 Ok(verified_type) => {
@@ -217,20 +220,8 @@ impl Handler for ConnectionHandler {
                         github_user, verified_type
                     );
 
-                    // Cache the key
-                    let entry = KeyCacheEntry {
-                        github_username: github_user.clone(),
-                        verified_at: Utc::now(),
-                        key_type: verified_type,
-                    };
-                    if let Err(e) = self
-                        .server
-                        .state
-                        .cache_key(fingerprint.clone(), entry)
-                        .await
-                    {
-                        warn!("Failed to cache key: {}", e);
-                    }
+                    // Cache ALL offered keys for this GitHub user
+                    self.cache_all_offered_keys(&github_user, &verified_type).await;
 
                     self.github_user = Some(github_user);
                     return Ok(Auth::Accept);
@@ -246,15 +237,12 @@ impl Handler for ConnectionHandler {
         }
 
         // Check bootstrap users
+        let openssh_key = public_key_to_openssh(public_key);
         for bootstrap_user in &self.server.config.bootstrap_github_users {
-            let key_str = public_key_to_openssh(public_key);
-            let key_type = key_str.split_whitespace().next().unwrap_or("unknown");
-            let full_key = format!("{} {}", key_type, key_str);
-
             if let Ok(verified_type) = self
                 .server
                 .github_fetcher
-                .verify_key(bootstrap_user, &full_key)
+                .verify_key(bootstrap_user, &openssh_key)
                 .await
             {
                 info!(
@@ -262,32 +250,21 @@ impl Handler for ConnectionHandler {
                     bootstrap_user, verified_type
                 );
 
-                // Cache the key
-                let entry = KeyCacheEntry {
-                    github_username: bootstrap_user.clone(),
-                    verified_at: Utc::now(),
-                    key_type: verified_type,
-                };
-                if let Err(e) = self
-                    .server
-                    .state
-                    .cache_key(fingerprint.clone(), entry)
-                    .await
-                {
-                    warn!("Failed to cache key: {}", e);
-                }
+                // Cache ALL offered keys for this GitHub user
+                self.cache_all_offered_keys(bootstrap_user, &verified_type).await;
 
                 self.github_user = Some(bootstrap_user.clone());
                 return Ok(Auth::Accept);
             }
         }
 
-        // No match found - need keyboard-interactive to get GitHub username
-        info!(
-            "Key not cached, requesting keyboard-interactive auth for {}",
-            self.peer_addr
+        // No match found yet. Keep publickey enabled so the client can try other keys.
+        // Keyboard-interactive remains enabled as a fallback after keys are exhausted.
+        debug!(
+            "Key {} not cached for {}, allowing client to try other keys",
+            fingerprint, self.peer_addr
         );
-        let methods = MethodSet::from(&[MethodKind::KeyboardInteractive][..]);
+        let methods = MethodSet::from(&[MethodKind::PublicKey, MethodKind::KeyboardInteractive][..]);
         Ok(Auth::Reject {
             proceed_with_methods: Some(methods),
             partial_success: false,
@@ -354,6 +331,12 @@ impl Handler for ConnectionHandler {
     ) -> Result<Auth, Self::Error> {
         debug!("Public key auth (with signature) for user '{}'", user);
 
+        // Track this key too
+        let fingerprint = compute_fingerprint_from_pubkey(public_key);
+        if !self.offered_key_fingerprints.contains(&fingerprint) {
+            self.offered_key_fingerprints.push(fingerprint.clone());
+        }
+
         // If we already have a github_user from offered phase, accept
         if self.github_user.is_some() {
             return Ok(Auth::Accept);
@@ -361,29 +344,17 @@ impl Handler for ConnectionHandler {
 
         // If we have a pending github user from keyboard-interactive, verify
         if let Some(github_user) = self.pending_github_user.take() {
-            let key_str = public_key_to_openssh(public_key);
-            let key_type = key_str.split_whitespace().next().unwrap_or("unknown");
-            let full_key = format!("{} {}", key_type, key_str);
+            let openssh_key = public_key_to_openssh(public_key);
 
             match self
                 .server
                 .github_fetcher
-                .verify_key(&github_user, &full_key)
+                .verify_key(&github_user, &openssh_key)
                 .await
             {
                 Ok(verified_type) => {
-                    use russh::keys::PublicKeyBase64;
-                    let key_str = public_key.public_key_base64();
-                    let fingerprint = compute_fingerprint_from_bytes(key_str.as_bytes());
-
-                    let entry = KeyCacheEntry {
-                        github_username: github_user.clone(),
-                        verified_at: Utc::now(),
-                        key_type: verified_type,
-                    };
-                    if let Err(e) = self.server.state.cache_key(fingerprint, entry).await {
-                        warn!("Failed to cache key: {}", e);
-                    }
+                    // Cache ALL offered keys for this GitHub user
+                    self.cache_all_offered_keys(&github_user, &verified_type).await;
 
                     self.github_user = Some(github_user);
                     return Ok(Auth::Accept);
@@ -420,6 +391,9 @@ impl Handler for ConnectionHandler {
             "PTY request: term={}, cols={}, rows={}",
             term, col_width, row_height
         );
+        // Store PTY dimensions for use when creating exec
+        self.pty_size = Some((col_width, row_height));
+        self.term = Some(term.to_string());
         Ok(())
     }
 
@@ -449,6 +423,9 @@ impl Handler for ConnectionHandler {
 
         self.container_id = Some(container_id.clone());
 
+        // Use stored TERM from pty_request, or default
+        let term = self.term.as_deref().unwrap_or("xterm-256color");
+
         // Create exec in container
         let exec_id = self
             .server
@@ -457,12 +434,24 @@ impl Handler for ConnectionHandler {
                 &container_id,
                 vec!["bash".to_string(), "-l".to_string()],
                 true,
-                Some(vec!["TERM=xterm-256color".to_string()]),
+                Some(vec![format!("TERM={}", term)]),
             )
             .await?;
 
         // Start exec and connect to channel
-        self.start_exec_session(channel_id, exec_id, session).await?;
+        self.start_exec_session(channel_id, exec_id.clone(), session).await?;
+
+        // Resize to stored PTY dimensions
+        if let Some((cols, rows)) = self.pty_size {
+            if let Err(e) = self
+                .server
+                .container_manager
+                .resize_exec(&exec_id, cols as u16, rows as u16)
+                .await
+            {
+                warn!("Failed to set initial exec size: {}", e);
+            }
+        }
 
         Ok(())
     }
@@ -495,6 +484,9 @@ impl Handler for ConnectionHandler {
 
         self.container_id = Some(container_id.clone());
 
+        // Use stored TERM from pty_request, or default
+        let term = self.term.as_deref().unwrap_or("xterm-256color");
+
         // Create exec in container
         let exec_id = self
             .server
@@ -503,12 +495,24 @@ impl Handler for ConnectionHandler {
                 &container_id,
                 vec!["bash".to_string(), "-lc".to_string(), command],
                 true,
-                Some(vec!["TERM=xterm-256color".to_string()]),
+                Some(vec![format!("TERM={}", term)]),
             )
             .await?;
 
         // Start exec and connect to channel
-        self.start_exec_session(channel_id, exec_id, session).await?;
+        self.start_exec_session(channel_id, exec_id.clone(), session).await?;
+
+        // Resize to stored PTY dimensions
+        if let Some((cols, rows)) = self.pty_size {
+            if let Err(e) = self
+                .server
+                .container_manager
+                .resize_exec(&exec_id, cols as u16, rows as u16)
+                .await
+            {
+                warn!("Failed to set initial exec size: {}", e);
+            }
+        }
 
         Ok(())
     }
@@ -812,6 +816,33 @@ impl Handler for ConnectionHandler {
 }
 
 impl ConnectionHandler {
+    /// Cache all offered keys for a GitHub user.
+    ///
+    /// This ensures that all keys the client offered during auth are cached,
+    /// not just the one that was verified against GitHub. This prevents
+    /// repeated keyboard-interactive prompts when the client offers keys
+    /// in a different order on reconnect.
+    async fn cache_all_offered_keys(&self, github_user: &str, key_type: &str) {
+        for fingerprint in &self.offered_key_fingerprints {
+            // Skip if already cached
+            if self.server.state.get_github_user(fingerprint).await.is_some() {
+                continue;
+            }
+
+            let entry = KeyCacheEntry {
+                github_username: github_user.to_string(),
+                verified_at: Utc::now(),
+                key_type: key_type.to_string(),
+            };
+
+            if let Err(e) = self.server.state.cache_key(fingerprint.clone(), entry).await {
+                warn!("Failed to cache key {}: {}", fingerprint, e);
+            } else {
+                info!("Cached key {} for GitHub user '{}'", fingerprint, github_user);
+            }
+        }
+    }
+
     /// Start an exec session and connect it to an SSH channel.
     async fn start_exec_session(
         &mut self,

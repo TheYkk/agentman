@@ -139,7 +139,8 @@ pub fn compute_fingerprint(public_key: &str) -> Result<String> {
     Ok(format!("SHA256:{}", b64))
 }
 
-/// Compute fingerprint from raw key bytes (as provided by russh).
+/// Compute fingerprint from raw key bytes (wire format).
+/// SSH fingerprint = SHA256(raw_key_bytes_in_wire_format)
 pub fn compute_fingerprint_from_bytes(key_bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(key_bytes);
@@ -149,11 +150,36 @@ pub fn compute_fingerprint_from_bytes(key_bytes: &[u8]) -> String {
     format!("SHA256:{}", b64)
 }
 
-/// Convert russh public key to OpenSSH string format for verification.
-pub fn public_key_to_openssh(key: &russh::keys::PublicKey) -> String {
-    // Use russh-keys built-in conversion
+/// Compute fingerprint from a russh public key.
+/// The fingerprint is SHA256 of the raw key bytes in SSH wire format.
+pub fn compute_fingerprint_from_pubkey(key: &russh::keys::PublicKey) -> String {
     use russh::keys::PublicKeyBase64;
-    key.public_key_base64()
+    // public_key_bytes() returns the raw key data in SSH wire format
+    let raw_bytes = key.public_key_bytes();
+    compute_fingerprint_from_bytes(&raw_bytes)
+}
+
+/// Convert russh public key to OpenSSH string format for verification.
+/// Returns format: "ssh-ed25519 AAAA..." or "ssh-rsa AAAA..."
+pub fn public_key_to_openssh(key: &russh::keys::PublicKey) -> String {
+    use russh::keys::PublicKeyBase64;
+    
+    // Get the key type string
+    let key_type = match key.algorithm() {
+        russh::keys::Algorithm::Ed25519 => "ssh-ed25519",
+        russh::keys::Algorithm::Rsa { .. } => "ssh-rsa",
+        russh::keys::Algorithm::Ecdsa { curve } => match curve {
+            russh::keys::EcdsaCurve::NistP256 => "ecdsa-sha2-nistp256",
+            russh::keys::EcdsaCurve::NistP384 => "ecdsa-sha2-nistp384",
+            russh::keys::EcdsaCurve::NistP521 => "ecdsa-sha2-nistp521",
+        },
+        _ => "unknown",
+    };
+    
+    // Get the base64-encoded key data
+    let key_base64 = key.public_key_base64();
+    
+    format!("{} {}", key_type, key_base64)
 }
 
 /// Parse username from SSH username field.
