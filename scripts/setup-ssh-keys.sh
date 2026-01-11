@@ -29,3 +29,6 @@ else
     echo "Warning: Failed to download SSH keys from ${KEYS_URL}" >&2
     exit 1
 fi
+
+git config --global user.name "agentman"
+git config --global user.email "agentman@theykk.net"

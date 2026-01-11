@@ -7,8 +7,9 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -20,7 +21,8 @@ use russh::server::{Auth, Handler, Msg, Session};
 use russh::{Channel, ChannelId, CryptoVec, MethodKind, MethodSet};
 use russh::keys::PublicKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UnixListener, UnixStream};
+use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -79,6 +81,9 @@ pub struct ConnectionHandler {
 
     /// PTY info per SSH channel (set by pty_request).
     ptys: HashMap<ChannelId, PtyInfo>,
+
+    /// OpenSSH agent forwarding state for this SSH connection (if enabled by the client).
+    agent_forwarding: Option<AgentForwardingState>,
 }
 
 struct ExecSession {
@@ -103,7 +108,85 @@ enum ChannelStreamKind {
     TcpForward,
 }
 
-fn exec_env(tty: bool, term: &str) -> Vec<String> {
+static NEXT_AGENT_FWD_ID: AtomicU64 = AtomicU64::new(1);
+const AGENT_FWD_SYMLINK_NAME: &str = ".agentman-ssh-agent.sock";
+
+struct AgentForwardingState {
+    socket_host_path: PathBuf,
+    socket_filename: String,
+    symlink_host_path: PathBuf,
+    symlink_filename: String,
+    accept_task: tokio::task::JoinHandle<()>,
+}
+
+impl AgentForwardingState {
+    fn ssh_auth_sock_in_container(&self) -> String {
+        // The workspace is bind-mounted into the container at /workspace.
+        format!("/workspace/{}", self.symlink_filename)
+    }
+}
+
+impl Drop for AgentForwardingState {
+    fn drop(&mut self) {
+        self.accept_task.abort();
+
+        // Best-effort cleanup: remove the unique socket file for this connection.
+        let _ = std::fs::remove_file(&self.socket_host_path);
+
+        // If the stable symlink still points at *our* socket, remove it too. This avoids leaving
+        // a dangling symlink when the last agent-forwarding connection exits, while still being
+        // safe with concurrent connections (last one wins).
+        match std::fs::read_link(&self.symlink_host_path) {
+            Ok(target) if target == PathBuf::from(&self.socket_filename) => {
+                let _ = std::fs::remove_file(&self.symlink_host_path);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn update_agent_symlink(workspace_host_path: &Path, target_filename: &str) -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let tmp = workspace_host_path.join(format!("{AGENT_FWD_SYMLINK_NAME}.tmp"));
+    let link = workspace_host_path.join(AGENT_FWD_SYMLINK_NAME);
+
+    let _ = std::fs::remove_file(&tmp);
+    // Use a relative symlink so paths stay short and portable within the bind mount.
+    symlink(target_filename, &tmp).with_context(|| {
+        format!(
+            "Failed to create agent forwarding symlink {} -> {}",
+            tmp.display(),
+            target_filename
+        )
+    })?;
+    std::fs::rename(&tmp, &link)
+        .with_context(|| format!("Failed to atomically replace {}", link.display()))?;
+    Ok(())
+}
+
+async fn bridge_agent_forwarding(sock: UnixStream, channel: Channel<Msg>) -> Result<()> {
+    let (mut chan_rx, chan_tx) = channel.split();
+    let mut chan_reader = chan_rx.make_reader();
+    let mut chan_writer = chan_tx.make_writer();
+
+    let (mut sock_r, mut sock_w) = sock.into_split();
+
+    let a_to_b = tokio::io::copy(&mut sock_r, &mut chan_writer);
+    let b_to_a = tokio::io::copy(&mut chan_reader, &mut sock_w);
+
+    tokio::select! {
+        _ = a_to_b => {}
+        _ = b_to_a => {}
+    }
+
+    let _ = chan_tx.eof().await;
+    let _ = chan_tx.close().await;
+    let _ = sock_w.shutdown().await;
+    Ok(())
+}
+
+fn exec_env(tty: bool, term: &str, ssh_auth_sock: Option<&str>) -> Vec<String> {
     // Keep this small and non-invasive:
     // - Zed (and other editors) probe `$SHELL` over non-PTY exec sessions.
     // - Some clients run `cd; ...` which fails if HOME is missing.
@@ -112,6 +195,9 @@ fn exec_env(tty: bool, term: &str) -> Vec<String> {
         env.push(format!("TERM={}", term));
     } else {
         env.push("HOME=/workspace".to_string());
+    }
+    if let Some(sock) = ssh_auth_sock {
+        env.push(format!("SSH_AUTH_SOCK={}", sock));
     }
     env
 }
@@ -130,6 +216,7 @@ impl ConnectionHandler {
             remote_forwards: HashMap::new(),
             offered_key_fingerprints: Vec::new(),
             ptys: HashMap::new(),
+            agent_forwarding: None,
         }
     }
 }
@@ -472,6 +559,11 @@ impl Handler for ConnectionHandler {
             None => (false, "xterm-256color"),
         };
 
+        let ssh_auth_sock = self
+            .agent_forwarding
+            .as_ref()
+            .map(|a| a.ssh_auth_sock_in_container());
+
         let cmd = match self.server.config.shell.mode {
             ShellMode::Bash => vec!["/bin/bash".to_string(), "-l".to_string()],
             ShellMode::Tmux => {
@@ -499,7 +591,7 @@ impl Handler for ConnectionHandler {
                 &container_id,
                 cmd,
                 tty,
-                Some(exec_env(tty, term)),
+                Some(exec_env(tty, term, ssh_auth_sock.as_deref())),
             )
             .await?;
 
@@ -671,6 +763,11 @@ impl Handler for ConnectionHandler {
             None => (false, "xterm-256color"),
         };
 
+        let ssh_auth_sock = self
+            .agent_forwarding
+            .as_ref()
+            .map(|a| a.ssh_auth_sock_in_container());
+
         // Create exec in container
         let exec_id = self
             .server
@@ -681,7 +778,7 @@ impl Handler for ConnectionHandler {
                 // This avoids user rc files (e.g. tmux auto-attach) breaking editor bootstrap flows.
                 vec!["/bin/bash".to_string(), "-c".to_string(), command],
                 tty,
-                Some(exec_env(tty, term)),
+                Some(exec_env(tty, term, ssh_auth_sock.as_deref())),
             )
             .await?;
 
@@ -748,6 +845,165 @@ impl Handler for ConnectionHandler {
         }
 
         Ok(())
+    }
+
+    /// Handle OpenSSH agent forwarding request (`ForwardAgent`).
+    async fn agent_request(
+        &mut self,
+        channel_id: ChannelId,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        if !self.server.config.agent_forwarding.allow {
+            warn!("Agent forwarding denied by policy");
+            session.channel_failure(channel_id)?;
+            return Ok(false);
+        }
+
+        // Idempotent: a client may request this multiple times on the same connection.
+        if self.agent_forwarding.is_some() {
+            session.channel_success(channel_id)?;
+            return Ok(true);
+        }
+
+        let github_user = self
+            .github_user
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not authenticated"))?;
+        let project = self
+            .project
+            .as_ref()
+            .ok_or_else(|| anyhow!("No project specified"))?;
+
+        let workspace_host_path = self.server.config.workspace_path(github_user, project);
+        tokio::fs::create_dir_all(&workspace_host_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to create workspace directory for agent forwarding: {}",
+                    workspace_host_path.display()
+                )
+            })?;
+
+        let id = NEXT_AGENT_FWD_ID.fetch_add(1, Ordering::Relaxed);
+        let socket_filename = format!(".agentman-ssh-agent.{id}.sock");
+        let socket_host_path = workspace_host_path.join(&socket_filename);
+
+        // Remove stale socket file if present (e.g. after an unclean shutdown).
+        let _ = tokio::fs::remove_file(&socket_host_path).await;
+
+        let listener = UnixListener::bind(&socket_host_path).with_context(|| {
+            format!(
+                "Failed to bind agent forwarding socket: {}",
+                socket_host_path.display()
+            )
+        })?;
+
+        // Make the socket usable from the container user (UID/GID 1000 in the base image).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut chowned = false;
+            match Command::new("chown")
+                .arg("1000:1000")
+                .arg(&socket_host_path)
+                .status()
+                .await
+            {
+                Ok(status) if status.success() => chowned = true,
+                Ok(status) => warn!(
+                    "chown 1000:1000 {} exited with status {}",
+                    socket_host_path.display(),
+                    status
+                ),
+                Err(e) => warn!(
+                    "Failed to run chown 1000:1000 {}: {}",
+                    socket_host_path.display(),
+                    e
+                ),
+            }
+
+            // If we couldn't chown (common when not running as root), fall back to a permissive mode
+            // so ForwardAgent works. The socket lives under the user's workspace directory.
+            let mode = if chowned { 0o600 } else { 0o666 };
+            if let Err(e) = std::fs::set_permissions(
+                &socket_host_path,
+                std::fs::Permissions::from_mode(mode),
+            ) {
+                warn!(
+                    "Failed to chmod agent socket {}: {}",
+                    socket_host_path.display(),
+                    e
+                );
+            }
+        }
+
+        // Prefer a stable SSH_AUTH_SOCK path via symlink, so long-lived sessions (e.g. tmux) can
+        // keep using the same env var across reconnects. If symlinks aren't available, fall back
+        // to exposing the unique socket path directly.
+        let (symlink_host_path, symlink_filename) =
+            match update_agent_symlink(&workspace_host_path, &socket_filename) {
+                Ok(()) => (
+                    workspace_host_path.join(AGENT_FWD_SYMLINK_NAME),
+                    AGENT_FWD_SYMLINK_NAME.to_string(),
+                ),
+                Err(e) => {
+                    warn!(
+                        "Failed to create stable SSH_AUTH_SOCK symlink; falling back to unique socket path: {}",
+                        e
+                    );
+                    (socket_host_path.clone(), socket_filename.clone())
+                }
+            };
+
+        let handle = session.handle();
+        let accept_task = tokio::spawn(async move {
+            loop {
+                let (sock, _addr) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        debug!("Agent forwarding accept error: {}", e);
+                        break;
+                    }
+                };
+
+                let handle = handle.clone();
+                tokio::spawn(async move {
+                    match handle.channel_open_agent().await {
+                        Ok(chan) => {
+                            if let Err(e) = bridge_agent_forwarding(sock, chan).await {
+                                debug!("Agent forwarding bridge ended: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            debug!("Failed to open agent forwarding channel: {}", e);
+                            // Drop the Unix socket (client will see ECONNRESET/EOF).
+                        }
+                    }
+                });
+            }
+        });
+
+        self.agent_forwarding = Some(AgentForwardingState {
+            socket_host_path,
+            socket_filename,
+            symlink_host_path,
+            symlink_filename,
+            accept_task,
+        });
+
+        info!(
+            "Agent forwarding enabled for {}/{} (SSH_AUTH_SOCK={})",
+            github_user,
+            project,
+            self.agent_forwarding
+                .as_ref()
+                .map(|a| a.ssh_auth_sock_in_container())
+                .unwrap_or_else(|| "<unknown>".to_string())
+        );
+
+        session.channel_success(channel_id)?;
+        Ok(true)
     }
 
     /// Handle data from client.

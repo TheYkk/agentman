@@ -119,6 +119,26 @@ This is useful for:
 - Exposing your local language server to remote code
 - Sharing a local database with the container
 
+### SSH Agent Forwarding (ForwardAgent)
+
+If you enable SSH agent forwarding on your client, the gateway can expose your local SSH agent inside the container as `SSH_AUTH_SOCK`. This lets you use your laptop’s keys for things like GitHub SSH without copying private keys into the sandbox.
+
+Add to your `~/.ssh/config`:
+
+```
+Host agent
+  ForwardAgent yes
+```
+
+Then inside the container:
+
+```bash
+echo "$SSH_AUTH_SOCK"
+ssh-add -L
+```
+
+Security note: any process inside the container can ask your forwarded agent to sign during the lifetime of the SSH connection. Enable only if you trust the remote environment.
+
 ### Editor Integration
 
 **Zed Editor**:
@@ -165,6 +185,9 @@ allow_local = true      # Allow -L (local port forward)
 allow_remote = true     # Allow -R (remote port forward)
 allow_gateway_ports = false  # Bind -R only to loopback
 allow_nonlocal_destinations = false  # Only forward to localhost/container
+
+[agent_forwarding]
+allow = true  # Allow ForwardAgent / SSH_AUTH_SOCK inside the container
 
 [container_security]
 cap_drop_all = true

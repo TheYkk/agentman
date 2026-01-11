@@ -43,6 +43,12 @@ allow_gateway_ports = false
 # If false, only localhost/127.0.0.1/container IP allowed
 allow_nonlocal_destinations = false
 
+[agent_forwarding]
+# Allow `ForwardAgent` (SSH agent forwarding) so SSH_AUTH_SOCK is available inside the container.
+# Security note: any process inside the container can ask your forwarded agent to sign during the
+# lifetime of the SSH connection. Enable only if you trust the remote environment.
+allow = true
+
 [container_security]
 # Drop all Linux capabilities
 cap_drop_all = true
