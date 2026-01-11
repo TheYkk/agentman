@@ -61,7 +61,7 @@ If you need language drivers, install them using the repo conventions:
 
 ### Tools available in the Docker image
 
-Derived from `Dockerfile` + `docker/versions.env`:
+Derived from `Dockerfile` + `docker-bake.hcl`:
 
 - **Pinned tools**:
   - **Rust** via rustup (toolchain `1.92.0`)

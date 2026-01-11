@@ -1,8 +1,6 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
-ENV_FILE ?= docker/versions.env
-
 .PHONY: help
 help:
 	@echo "Targets:"
@@ -23,33 +21,36 @@ help:
 
 .PHONY: vars
 vars:
-	@set -a; . "$(ENV_FILE)"; set +a; \
-	echo "ENV_FILE=$$(realpath "$(ENV_FILE)" 2>/dev/null || echo "$(ENV_FILE)")"; \
-	env | grep -E '^(IMAGE_NAME|IMAGE_TAG|PLATFORMS|DEBIAN_TAG|RUSTUP_VERSION|RUST_TOOLCHAIN|GO_VERSION|BUN_VERSION|UV_VERSION|PYTHON_VERSION|OPENCODE_VERSION|USERNAME|USER_UID|USER_GID)=' | sort
+	@echo "BAKE_FILE=$$(realpath docker-bake.hcl 2>/dev/null || echo docker-bake.hcl)"; \
+	python3 scripts/check-bake-versions.py --print-vars --only \
+	  IMAGE_NAME IMAGE_TAG PLATFORMS \
+	  DEBIAN_TAG \
+	  RUSTUP_VERSION RUST_TOOLCHAIN GO_VERSION BUN_VERSION UV_VERSION PYTHON_VERSION \
+	  SDKMAN_VERSION JAVA_VERSION \
+	  DUCKDB_VERSION OPENCODE_VERSION \
+	  USERNAME USER_UID USER_GID \
+	| sort
 
 .PHONY: build
 build:
-	@set -a; . "$(ENV_FILE)"; set +a; \
-	docker buildx bake -f docker-bake.hcl --load
+	@docker buildx bake -f docker-bake.hcl --load
 
 .PHONY: build-nc
 build-nc:
-	@set -a; . "$(ENV_FILE)"; set +a; \
-	docker buildx bake -f docker-bake.hcl --load --no-cache
+	@docker buildx bake -f docker-bake.hcl --load --no-cache
 
 .PHONY: push
 push:
-	@set -a; . "$(ENV_FILE)"; set +a; \
-	docker buildx bake -f docker-bake.hcl --push
+	@docker buildx bake -f docker-bake.hcl --push
 
 .PHONY: run
 run:
-	@set -a; . "$(ENV_FILE)"; set +a; \
+	@eval "$$(python3 scripts/check-bake-versions.py --print-vars --only IMAGE_NAME IMAGE_TAG --export)"; \
 	docker run --rm -it "$${IMAGE_NAME}:$${IMAGE_TAG}"
 
 .PHONY: shell
 shell:
-	@set -a; . "$(ENV_FILE)"; set +a; \
+	@eval "$$(python3 scripts/check-bake-versions.py --print-vars --only IMAGE_NAME IMAGE_TAG --export)"; \
 	docker run --rm -it --entrypoint bash "$${IMAGE_NAME}:$${IMAGE_TAG}"
 
 # Gateway targets

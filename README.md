@@ -281,7 +281,7 @@ Note: `agentman exec <cmd>` is accepted as an alias (e.g. `agentman exec stats -
 
 ### Configure versions
 
-Edit `docker/versions.env`:
+Edit `docker-bake.hcl` (the `variable` defaults near the top), or override via environment variables:
 - **Base image**: `DEBIAN_TAG`
 - **Tools**: `RUSTUP_VERSION`, `RUST_TOOLCHAIN`, `GO_VERSION`, `BUN_VERSION`, `UV_VERSION`, `PYTHON_VERSION`, `SDKMAN_VERSION`, `JAVA_VERSION`, `DUCKDB_VERSION`, `OPENCODE_VERSION`
 - **User**: `USERNAME`, `USER_UID`, `USER_GID`
@@ -314,7 +314,7 @@ docker run --rm -it --entrypoint bash agentman-base:dev
 
 ### Build/push (CI / multi-arch)
 
-Set `PLATFORMS` in `docker/versions.env` (example):
+Set `PLATFORMS` (example):
 
 ```bash
 PLATFORMS=linux/amd64,linux/arm64

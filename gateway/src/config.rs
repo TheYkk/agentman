@@ -42,6 +42,24 @@ impl Default for ShellMode {
     }
 }
 
+/// OpenSSH agent forwarding configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentForwardingConfig {
+    /// Allow `ForwardAgent` / `auth-agent-req@openssh.com`.
+    ///
+    /// Security note: any process inside the container can talk to your forwarded agent
+    /// for the lifetime of the SSH connection (it cannot extract private keys, but it can
+    /// request signatures). Enable only if you trust the remote environment.
+    pub allow: bool,
+}
+
+impl Default for AgentForwardingConfig {
+    fn default() -> Self {
+        Self { allow: true }
+    }
+}
+
 /// Main gateway configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -69,6 +87,10 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub port_forwarding: PortForwardingConfig,
 
+    /// OpenSSH agent forwarding configuration
+    #[serde(default)]
+    pub agent_forwarding: AgentForwardingConfig,
+
     /// Interactive shell/session configuration
     #[serde(default)]
     pub shell: ShellConfig,
@@ -92,6 +114,7 @@ impl Default for GatewayConfig {
             host_key_path: data_dir.join("host_key"),
             bootstrap_github_users: Vec::new(),
             port_forwarding: PortForwardingConfig::default(),
+            agent_forwarding: AgentForwardingConfig::default(),
             shell: ShellConfig::default(),
             container_security: ContainerSecurityConfig::default(),
         }

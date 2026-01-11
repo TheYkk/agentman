@@ -1,9 +1,9 @@
-ARG DEBIAN_TAG=bookworm-slim
+ARG DEBIAN_TAG=trixie-slim
 FROM debian:${DEBIAN_TAG}
 
 # Keep this Dockerfile deterministic and CI-friendly:
 # - All non-apt tools are installed with explicit, configurable versions.
-# - Versions are set via build args (see `docker/versions.env` + `docker-bake.hcl`).
+# - Versions are set via build args (see `docker-bake.hcl`).
 
 ARG DEBIAN_TAG
 

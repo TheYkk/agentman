@@ -1,18 +1,13 @@
-// CI-friendly build definition for docker buildx bake.
+// CI-friendly build definition for `docker buildx bake`.
 //
-// Usage (local):
-//   set -a; . docker/versions.env; set +a
-//   docker buildx bake --load
-//
-// Usage (CI, multi-arch):
-//   set -a; . docker/versions.env; set +a
-//   docker buildx bake --push
+// You can override any `variable` via environment variables, e.g.:
+//   PLATFORMS=linux/amd64,linux/arm64 docker buildx bake --push
 
 variable "IMAGE_NAME"    { default = "agentman-base" }
 variable "IMAGE_TAG"     { default = "dev" }
 variable "PLATFORMS"     { default = "linux/amd64" }
 
-variable "DEBIAN_TAG"    { default = "bookworm-slim" }
+variable "DEBIAN_TAG"    { default = "trixie-slim" }
 variable "RUSTUP_VERSION"   { default = "1.27.1" }
 variable "RUST_TOOLCHAIN"   { default = "1.92.0" }
 variable "GO_VERSION"    { default = "1.25.5" }
