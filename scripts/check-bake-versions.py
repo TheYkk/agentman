@@ -8,6 +8,8 @@ Examples:
   python3 scripts/check-bake-versions.py
   python3 scripts/check-bake-versions.py --fail
   python3 scripts/check-bake-versions.py --print-vars --only IMAGE_NAME IMAGE_TAG
+  python3 scripts/check-bake-versions.py --update
+  python3 scripts/check-bake-versions.py --update --dry-run
 """
 
 from __future__ import annotations
@@ -436,6 +438,46 @@ def _print_vars(
         print(f"{prefix}{k}={shlex.quote(v)}")
 
 
+def _update_bake_file(
+    hcl_text: str,
+    checks: list[Check],
+    *,
+    skip_unknown: bool = True,
+) -> tuple[str, list[tuple[str, str, str]]]:
+    """
+    Update the HCL text with latest versions from checks.
+
+    Returns:
+        (updated_hcl_text, list of (name, old_value, new_value) tuples for changes made)
+    """
+    changes: list[tuple[str, str, str]] = []
+    updated = hcl_text
+
+    for check in checks:
+        if check.latest is None:
+            continue
+        if check.status == "ok":
+            continue
+        if check.status == "unknown" and skip_unknown:
+            continue
+
+        # Build regex to find and replace this specific variable
+        pattern = re.compile(
+            rf'(variable\s+"{re.escape(check.name)}"\s*\{{\s*default\s*=\s*)"([^"]*)"(\s*\}})',
+            flags=re.MULTILINE,
+        )
+
+        def replacer(m: re.Match[str]) -> str:
+            return f'{m.group(1)}"{check.latest}"{m.group(3)}'
+
+        new_text, count = pattern.subn(replacer, updated)
+        if count > 0 and new_text != updated:
+            changes.append((check.name, check.current, check.latest))
+            updated = new_text
+
+    return updated, changes
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--file", default=BAKE_DEFAULT, help="Path to docker-bake.hcl")
@@ -459,6 +501,17 @@ def main(argv: list[str]) -> int:
         help="When used with --print-vars, prefix each line with `export ` (shell-friendly)",
     )
 
+    ap.add_argument(
+        "--update",
+        action="store_true",
+        help="Update docker-bake.hcl with latest versions (for outdated checks)",
+    )
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="When used with --update, show what would be changed without writing",
+    )
+
     args = ap.parse_args(argv)
 
     try:
@@ -480,6 +533,36 @@ def main(argv: list[str]) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
+    # Update mode
+    if args.update:
+        updated_hcl, changes = _update_bake_file(hcl, checks)
+
+        if not changes:
+            print("All versions are up-to-date. Nothing to update.")
+            return 0
+
+        # Show what will be / was changed
+        print("Updates:" if not args.dry_run else "Would update:")
+        name_w = max(len(name) for name, _, _ in changes)
+        for name, old_val, new_val in changes:
+            print(f"  {name:<{name_w}}  {old_val} -> {new_val}")
+
+        if args.dry_run:
+            print(f"\nDry run: {args.file} not modified.")
+            return 0
+
+        # Write the updated file
+        try:
+            with open(args.file, "w", encoding="utf-8") as f:
+                f.write(updated_hcl)
+            print(f"\nUpdated {args.file}")
+        except OSError as e:
+            print(f"error: could not write {args.file!r}: {e}", file=sys.stderr)
+            return 2
+
+        return 0
+
+    # Normal check/report mode
     if args.json_out:
         payload = [
             {
