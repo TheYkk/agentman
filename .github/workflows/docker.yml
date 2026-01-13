@@ -10,7 +10,6 @@ on:
   pull_request:
     paths:
       - Dockerfile
-      - docker/**
       - docker-bake.hcl
       - scripts/**
       - AGENTS.md
@@ -24,6 +23,8 @@ concurrency:
 jobs:
   docker:
     runs-on: ubuntu-latest
+    # Avoid duplicate builds if an automation workflow pushes commits; those workflows can build/push themselves.
+    if: github.event_name != 'push' || github.actor != 'github-actions[bot]'
     permissions:
       contents: read
       packages: write
@@ -32,11 +33,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Load docker build variables
+      - name: Set docker build variables
         shell: bash
         run: |
           set -euo pipefail
-          grep -E '^[A-Za-z_][A-Za-z0-9_]*=' docker/versions.env >> "$GITHUB_ENV"
           echo "PLATFORMS=${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}" >> "$GITHUB_ENV"
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/agentman-base"
           echo "IMAGE=$image" >> "$GITHUB_ENV"
