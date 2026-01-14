@@ -12,12 +12,12 @@ variable "RUSTUP_VERSION"   { default = "1.28.2" }
 variable "RUST_TOOLCHAIN"   { default = "1.92.0" }
 variable "GO_VERSION"    { default = "1.25.5" }
 variable "BUN_VERSION"   { default = "1.3.6" }
-variable "UV_VERSION"    { default = "0.9.24" }
+variable "UV_VERSION"    { default = "0.9.25" }
 variable "PYTHON_VERSION" { default = "3.13" }
 variable "SDKMAN_VERSION" { default = "5.20.0" }
 variable "JAVA_VERSION"   { default = "21.0.9-tem" }
 variable "DUCKDB_VERSION" { default = "1.4.3" }
-variable "OPENCODE_VERSION" { default = "v1.1.15" }
+variable "OPENCODE_VERSION" { default = "v1.1.19" }
 
 variable "USERNAME"      { default = "agent" }
 variable "USER_UID"      { default = "1000" }
