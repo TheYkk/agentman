@@ -29,6 +29,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8
 
+# `bsdmainutils` may be absent on newer Debian releases; fall back to `bsdextrautils`.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       bash \
@@ -88,10 +89,6 @@ RUN apt-get update \
       python3-venv \
       python-is-python3 \
       pipx \
- && rm -rf /var/lib/apt/lists/*
-
-# `bsdmainutils` may be absent on newer Debian releases; fall back to `bsdextrautils`.
-RUN apt-get update \
  && if apt-get install -y --no-install-recommends bsdmainutils; then \
       true; \
     else \
@@ -150,8 +147,6 @@ RUN arch="$(dpkg --print-architecture)" \
  && rm -f /tmp/node.tar.xz \
  && node --version \
  && npm --version
-
-ENV PATH="/usr/local/go/bin:/usr/local/bun/bin:${PATH}"
 
 # --- Bun (pinned) ---
 ENV BUN_INSTALL=/usr/local/bun
@@ -215,7 +210,7 @@ ENV HOME=/home/${USERNAME} \
     GOPATH=/home/${USERNAME}/go \
     SDKMAN_DIR=/home/${USERNAME}/.sdkman \
     JAVA_HOME=/home/${USERNAME}/.sdkman/candidates/java/current \
-    PATH=/home/${USERNAME}/.cargo/bin:/home/${USERNAME}/.local/bin:/home/${USERNAME}/go/bin:/usr/local/go/bin:/usr/local/bun/bin:/home/${USERNAME}/.sdkman/candidates/java/current/bin:${PATH}
+    PATH=/home/${USERNAME}/.cargo/bin:/home/${USERNAME}/.local/bin:/home/${USERNAME}/go/bin:/usr/local/go/bin:/usr/local/bun/bin:/usr/local/node/bin:/home/${USERNAME}/.sdkman/candidates/java/current/bin:${PATH}
 
 # --- Rust via rustup (pinned rustup-init + pinned toolchain) ---
 RUN arch="$(dpkg --print-architecture)" \
@@ -278,8 +273,8 @@ RUN arch="$(dpkg --print-architecture)" \
 RUN mkdir -p "${SDKMAN_DIR}/var" \
  && printf '%s' "${SDKMAN_VERSION}" >"${SDKMAN_DIR}/var/version"
 
-# Ensure interactive shells have `sdk` available.
-RUN printf '\n# Agent toolchain paths\nexport GOPATH=\"$HOME/go\"\nexport PATH=\"$HOME/.cargo/bin:$HOME/.local/bin:$GOPATH/bin:/usr/local/go/bin:/usr/local/bun/bin:$PATH\"\n\n# SDKMAN\nexport SDKMAN_DIR=\"$HOME/.sdkman\"\n[[ -s \"$SDKMAN_DIR/bin/sdkman-init.sh\" ]] && source \"$SDKMAN_DIR/bin/sdkman-init.sh\"\n' \
+# Ensure interactive shells have SDKMAN available.
+RUN printf '\n# SDKMAN\nexport SDKMAN_DIR=\"$HOME/.sdkman\"\n[[ -s \"$SDKMAN_DIR/bin/sdkman-init.sh\" ]] && source \"$SDKMAN_DIR/bin/sdkman-init.sh\"\n' \
  | tee -a "${HOME}/.bashrc" "${HOME}/.profile" >/dev/null
 
 # Copy scripts (switch to root temporarily for installation)
