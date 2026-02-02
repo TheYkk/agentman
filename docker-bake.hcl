@@ -12,7 +12,6 @@ variable "RUSTUP_VERSION"   { default = "1.28.2" }
 variable "RUST_TOOLCHAIN"   { default = "1.93.0" }
 variable "GO_VERSION"    { default = "1.25.6" }
 variable "BUN_VERSION"   { default = "1.3.8" }
-<<<<<<< HEAD
 variable "NODE_VERSION"  { default = "22.13.1" }
 variable "UV_VERSION"    { default = "0.9.29" }
 variable "PYTHON_VERSION" { default = "3.13" }
