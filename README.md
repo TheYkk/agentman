@@ -5,6 +5,7 @@ Debian-based base image for a coding agent with pinned versions of:
 - **rust-analyzer** (via `rustup component add`, pinned to toolchain)
 - **Go**
 - **Bun**
+- **Node.js**
 - **uv** + **Python** installed via `uv python install`
 - **Java** (via SDKMAN, pinned)
 - **DuckDB** (CLI)
@@ -194,8 +195,9 @@ cap_drop_all = true
 cap_add = ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]
 no_new_privileges = true
 readonly_rootfs = false
-memory_limit = "4g"
-cpu_limit = 2.0
+# Optional resource limits (omit for no limits; defaults to no limits)
+# memory_limit = "4g"
+# cpu_limit = 2.0
 use_seccomp = true
 ```
 
@@ -208,7 +210,7 @@ Containers are created with security hardening by default:
 - **Capability dropping**: All caps dropped, minimal set re-added
 - **No-new-privileges**: Prevents privilege escalation via setuid binaries
 - **Seccomp**: Default Docker seccomp profile applied
-- **Resource limits**: Memory and CPU limits enforced
+- **Optional resource limits**: Memory/CPU limits are configurable (default: no limits)
 - **Isolated networking**: Bridge network only, no host network
 
 The `/workspace` bind-mount is the only host path exposed to containers.
@@ -306,7 +308,7 @@ Note: `agentman exec <cmd>` is accepted as an alias (e.g. `agentman exec stats -
 
 Edit `docker-bake.hcl` (the `variable` defaults near the top), or override via environment variables:
 - **Base image**: `DEBIAN_TAG`
-- **Tools**: `RUSTUP_VERSION`, `RUST_TOOLCHAIN`, `GO_VERSION`, `BUN_VERSION`, `UV_VERSION`, `PYTHON_VERSION`, `SDKMAN_VERSION`, `JAVA_VERSION`, `DUCKDB_VERSION`, `OPENCODE_VERSION`
+- **Tools**: `RUSTUP_VERSION`, `RUST_TOOLCHAIN`, `GO_VERSION`, `BUN_VERSION`, `NODE_VERSION`, `UV_VERSION`, `PYTHON_VERSION`, `SDKMAN_VERSION`, `JAVA_VERSION`, `DUCKDB_VERSION`, `OPENCODE_VERSION`
 - **User**: `USERNAME`, `USER_UID`, `USER_GID`
 
 ### Build (local)

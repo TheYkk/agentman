@@ -12,6 +12,7 @@ ARG RUSTUP_VERSION=1.27.1
 ARG RUST_TOOLCHAIN=1.92.0
 ARG GO_VERSION=1.25.5
 ARG BUN_VERSION=1.3.5
+ARG NODE_VERSION=22.13.1
 ARG UV_VERSION=0.9.22
 ARG PYTHON_VERSION=3.13
 ARG SDKMAN_VERSION=5.20.0
@@ -131,6 +132,24 @@ RUN arch="$(dpkg --print-architecture)" \
  && ln -sf /usr/local/go/bin/go /usr/local/bin/go \
  && ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt \
  && go version
+
+# --- Node.js (pinned) ---
+RUN arch="$(dpkg --print-architecture)" \
+ && case "${arch}" in \
+      amd64) node_arch="x64" ;; \
+      arm64) node_arch="arm64" ;; \
+      *) echo "Unsupported dpkg architecture: ${arch}" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL -o /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${node_arch}.tar.xz" \
+ && rm -rf /usr/local/node \
+ && mkdir -p /usr/local/node \
+ && tar -C /usr/local/node --strip-components=1 -xJf /tmp/node.tar.xz \
+ && ln -sf /usr/local/node/bin/node /usr/local/bin/node \
+ && ln -sf /usr/local/node/bin/npm /usr/local/bin/npm \
+ && ln -sf /usr/local/node/bin/npx /usr/local/bin/npx \
+ && rm -f /tmp/node.tar.xz \
+ && node --version \
+ && npm --version
 
 ENV PATH="/usr/local/go/bin:/usr/local/bun/bin:${PATH}"
 

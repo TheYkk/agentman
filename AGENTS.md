@@ -67,6 +67,7 @@ Derived from `Dockerfile` + `docker-bake.hcl`:
   - **Rust** via rustup (toolchain `1.92.0`)
   - **Go** (`1.25.5`)
   - **Bun** (`1.3.5`)
+ - **Node.js** (pinned)
   - **uv/uvx** (`0.9.22`) + **Python** installed via `uv python install` (default `3.13`)
   - **DuckDB CLI** (`1.4.3`)
   - **opencode** (`v1.1.7`) (default `CMD` under `tini`)

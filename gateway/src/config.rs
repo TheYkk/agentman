@@ -166,10 +166,10 @@ pub struct ContainerSecurityConfig {
     /// Use read-only root filesystem
     pub readonly_rootfs: bool,
 
-    /// Memory limit (e.g., "2g")
+    /// Memory limit (e.g., "2g"). Omit for no limit.
     pub memory_limit: Option<String>,
 
-    /// CPU quota (e.g., "1.5" for 1.5 CPUs)
+    /// CPU limit (e.g., "1.5" for 1.5 CPUs). Omit for no limit.
     pub cpu_limit: Option<f64>,
 
     /// Use default seccomp profile
@@ -190,8 +190,8 @@ impl Default for ContainerSecurityConfig {
             ],
             no_new_privileges: true,
             readonly_rootfs: false, // Many tools need writable /tmp, /var, etc.
-            memory_limit: Some("4g".to_string()),
-            cpu_limit: Some(2.0),
+            memory_limit: None,
+            cpu_limit: None,
             use_seccomp: true,
         }
     }

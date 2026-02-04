@@ -66,10 +66,12 @@ no_new_privileges = true
 readonly_rootfs = false
 
 # Memory limit (e.g., "4g", "512m")
-memory_limit = "4g"
+# Omit to disable (default: no limit).
+# memory_limit = "4g"
 
 # CPU limit (e.g., 2.0 for 2 CPUs)
-cpu_limit = 2.0
+# Omit to disable (default: no limit).
+# cpu_limit = 2.0
 
 # Use default seccomp profile
 use_seccomp = true

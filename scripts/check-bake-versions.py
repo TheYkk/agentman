@@ -149,6 +149,40 @@ def _latest_go_version() -> str:
     return text.removeprefix("go")
 
 
+def _latest_node_patch_for_major(major: int) -> str | None:
+    """
+    Return the latest Node.js patch release for a given major.
+
+    Uses the official dist index:
+      https://nodejs.org/dist/index.json
+    """
+    data = _http_get_json("https://nodejs.org/dist/index.json")
+    if not isinstance(data, list):
+        raise RuntimeError("Unexpected Node.js dist index JSON")
+
+    best_key: tuple[int, ...] | None = None
+    best: str | None = None
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        v = item.get("version")
+        if not isinstance(v, str):
+            continue
+        v = v.strip()
+        if not v.startswith("v"):
+            continue
+        num = v.removeprefix("v")
+        key = _parse_ints(num)
+        if key is None or not key:
+            continue
+        if key[0] != major:
+            continue
+        if best_key is None or key > best_key:
+            best_key = key
+            best = num
+    return best
+
+
 def _debian_stable_codename() -> str:
     rel = _http_get_text("https://deb.debian.org/debian/dists/stable/Release")
     m = re.search(r"(?m)^Codename:\s*(\S+)\s*$", rel)
@@ -297,6 +331,23 @@ def _check_go_version(current: str) -> Check:
         return Check("GO_VERSION", current, None, "unknown", "go.dev", str(e))
 
 
+def _check_node_version(current: str) -> Check:
+    try:
+        cur_norm = _strip_prefixes(current, ("v",))
+        cur_key = _parse_ints(cur_norm)
+        if cur_key is None or not cur_key:
+            return Check("NODE_VERSION", current, None, "unknown", "nodejs.org", "unrecognized NODE_VERSION format")
+
+        latest = _latest_node_patch_for_major(cur_key[0])
+        if latest is None:
+            return Check("NODE_VERSION", current, None, "unknown", "nodejs.org", "could not find matching major releases")
+
+        status: Status = "ok" if cur_norm == latest else "outdated"
+        return Check("NODE_VERSION", current, latest, status, "nodejs.org")
+    except Exception as e:
+        return Check("NODE_VERSION", current, None, "unknown", "nodejs.org", str(e))
+
+
 def _check_rust_toolchain(current: str) -> Check:
     try:
         latest = _latest_rust_toolchain()
@@ -390,6 +441,7 @@ def _checks_for(bake_vars: dict[str, str]) -> list[Check]:
             strip=("bun-v", "v"),
         )
     )
+    checks.append(_check_node_version(cur("NODE_VERSION")))
     checks.append(_check_github_version(name="UV_VERSION", current=cur("UV_VERSION"), owner="astral-sh", repo="uv", strip=("v",)))
     checks.append(_check_python_version(cur("PYTHON_VERSION")))
     checks.append(_check_github_version(name="SDKMAN_VERSION", current=cur("SDKMAN_VERSION"), owner="sdkman", repo="sdkman-cli", strip=("v",)))
