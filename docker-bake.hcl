@@ -9,16 +9,16 @@ variable "PLATFORMS"     { default = "linux/amd64" }
 
 variable "DEBIAN_TAG"    { default = "trixie-slim" }
 variable "RUSTUP_VERSION"   { default = "1.28.2" }
-variable "RUST_TOOLCHAIN"   { default = "1.93.1" }
-variable "GO_VERSION"    { default = "1.26.0" }
+variable "RUST_TOOLCHAIN"   { default = "1.94.0" }
+variable "GO_VERSION"    { default = "1.26.1" }
 variable "BUN_VERSION"   { default = "1.3.10" }
-variable "NODE_VERSION"  { default = "22.22.0" }
+variable "NODE_VERSION"  { default = "22.22.1" }
 variable "UV_VERSION"    { default = "0.10.8" }
 variable "PYTHON_VERSION" { default = "3.13" }
 variable "SDKMAN_VERSION" { default = "5.20.0" }
 variable "JAVA_VERSION"   { default = "21.0.10-tem" }
 variable "DUCKDB_VERSION" { default = "1.4.4" }
-variable "OPENCODE_VERSION" { default = "v1.2.17" }
+variable "OPENCODE_VERSION" { default = "v1.2.18" }
 
 variable "USERNAME"      { default = "agent" }
 variable "USER_UID"      { default = "1000" }
