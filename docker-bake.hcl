@@ -17,8 +17,8 @@ variable "UV_VERSION"    { default = "0.10.9" }
 variable "PYTHON_VERSION" { default = "3.13" }
 variable "SDKMAN_VERSION" { default = "5.20.0" }
 variable "JAVA_VERSION"   { default = "21.0.10-tem" }
-variable "DUCKDB_VERSION" { default = "1.4.4" }
-variable "OPENCODE_VERSION" { default = "v1.2.22" }
+variable "DUCKDB_VERSION" { default = "1.5.0" }
+variable "OPENCODE_VERSION" { default = "v1.2.24" }
 
 variable "USERNAME"      { default = "agent" }
 variable "USER_UID"      { default = "1000" }
