@@ -8,7 +8,7 @@ variable "IMAGE_TAG"     { default = "dev" }
 variable "PLATFORMS"     { default = "linux/amd64" }
 
 variable "DEBIAN_TAG"    { default = "trixie-slim" }
-variable "RUSTUP_VERSION"   { default = "1.28.2" }
+variable "RUSTUP_VERSION"   { default = "1.29.0" }
 variable "RUST_TOOLCHAIN"   { default = "1.94.0" }
 variable "GO_VERSION"    { default = "1.26.1" }
 variable "BUN_VERSION"   { default = "1.3.10" }
@@ -18,7 +18,7 @@ variable "PYTHON_VERSION" { default = "3.13" }
 variable "SDKMAN_VERSION" { default = "5.20.0" }
 variable "JAVA_VERSION"   { default = "21.0.10-tem" }
 variable "DUCKDB_VERSION" { default = "1.5.0" }
-variable "OPENCODE_VERSION" { default = "v1.2.24" }
+variable "OPENCODE_VERSION" { default = "v1.2.25" }
 
 variable "USERNAME"      { default = "agent" }
 variable "USER_UID"      { default = "1000" }
