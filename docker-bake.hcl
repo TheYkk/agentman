@@ -9,7 +9,7 @@ variable "PLATFORMS"     { default = "linux/amd64" }
 
 variable "DEBIAN_TAG"    { default = "trixie-slim" }
 variable "RUSTUP_VERSION"   { default = "1.29.1" }
-variable "RUST_TOOLCHAIN"   { default = "1.98.0" }
+variable "RUST_TOOLCHAIN"   { default = "1.98.1" }
 variable "GO_VERSION"    { default = "1.27.1" }
 variable "BUN_VERSION"   { default = "1.4.0" }
 variable "NODE_VERSION"  { default = "22.23.2" }
