@@ -9,11 +9,11 @@ variable "PLATFORMS"     { default = "linux/amd64" }
 
 variable "DEBIAN_TAG"    { default = "trixie-slim" }
 variable "RUSTUP_VERSION"   { default = "1.29.1" }
-variable "RUST_TOOLCHAIN"   { default = "1.98.1" }
+variable "RUST_TOOLCHAIN"   { default = "1.99.0" }
 variable "GO_VERSION"    { default = "1.27.1" }
 variable "BUN_VERSION"   { default = "1.4.2" }
 variable "NODE_VERSION"  { default = "22.23.3" }
-variable "UV_VERSION"    { default = "0.12.21" }
+variable "UV_VERSION"    { default = "0.12.22" }
 variable "PYTHON_VERSION" { default = "3.13" }
 variable "SDKMAN_VERSION" { default = "5.23.1" }
 variable "JAVA_VERSION"   { default = "21.0.12-tem" }
