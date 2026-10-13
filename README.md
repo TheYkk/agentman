@@ -205,7 +205,7 @@ use_seccomp = true
 
 Containers are created with security hardening by default:
 
-- **No privileged mode**: Containers never run privileged
+- **No privileged mode**: Containers never run privileged (unless you opt into `docker_in_sandbox.mode = "privileged"`)
 - **No Docker socket**: Container cannot escape to host via Docker API
 - **Capability dropping**: All caps dropped, minimal set re-added
 - **No-new-privileges**: Prevents privilege escalation via setuid binaries
@@ -214,6 +214,25 @@ Containers are created with security hardening by default:
 - **Isolated networking**: Bridge network only, no host network
 
 The `/workspace` bind-mount is the only host path exposed to containers.
+
+### Docker Inside Sandboxes
+
+Each sandbox can run its own Docker daemon, so agents can `docker build`, `docker run` and `docker compose up` without touching the host's Docker socket.
+
+The recommended setup is [sysbox](https://github.com/nestybox/sysbox): install it on the gateway host (it registers a `sysbox-runc` runtime with Docker) and the gateway picks it up automatically. Sysbox runs the sandbox in a user namespace, so the inner `dockerd` has the capabilities it needs while root in the sandbox stays unprivileged on the host.
+
+```toml
+[docker_in_sandbox]
+mode = "auto"              # auto | sysbox | privileged | off
+sysbox_runtime = "sysbox-runc"
+persist_data = true        # keep inner images/build cache across container recreation
+```
+
+- `auto` (default) uses sysbox when the runtime is present and otherwise leaves Docker off, so existing hosts keep their current behavior.
+- `sysbox` requires the runtime; the gateway refuses to start without it.
+- `privileged` runs sandboxes with `--privileged` for hosts that cannot install sysbox. Root in such a sandbox is root on the host, so only use it for fully trusted users.
+
+When enabled, the gateway starts `dockerd` as root inside the sandbox whenever the container is created or reconnected to (logs in `/var/log/dockerd.log`), with the socket owned by the `agent` user's group so `docker` works without `sudo`. Inner Docker data lives in a named volume `agentman-docker-<github_user>-<project>`, which `agentman destroy` deletes together with the workspace (`--keep-workspace` keeps both). The mode is recorded on each container, so a change only applies to sandboxes created afterwards; destroy a sandbox (with `--keep-workspace`) to switch it.
 
 ### Container Naming
 

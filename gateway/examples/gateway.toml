@@ -75,3 +75,23 @@ readonly_rootfs = false
 
 # Use default seccomp profile
 use_seccomp = true
+
+[docker_in_sandbox]
+# Give each sandbox its own Docker daemon so `docker build` / `docker run` work inside it.
+#   "auto"       - use sysbox when the host Docker daemon has the sysbox runtime, otherwise off (default)
+#   "sysbox"     - always use sysbox; the gateway refuses to start if the runtime is missing
+#   "privileged" - run sandboxes with --privileged; sandbox root is host root, trusted users only
+#   "off"        - no Docker inside sandboxes
+# Sysbox (https://github.com/nestybox/sysbox) runs the sandbox in a user namespace, so the inner
+# dockerd gets the capabilities it needs without host root. The container_security cap_drop/cap_add
+# settings are not applied while Docker-in-sandbox is on.
+# A mode change applies to newly created sandboxes; destroy and reconnect to switch an existing one.
+mode = "auto"
+
+# Runtime name sysbox is registered under in /etc/docker/daemon.json
+sysbox_runtime = "sysbox-runc"
+
+# Keep inner images, build cache and volumes in a per-workspace named volume
+# (agentman-docker-<github_user>-<project>) so they survive container recreation.
+# The volume is deleted with the workspace on destroy.
+persist_data = true
