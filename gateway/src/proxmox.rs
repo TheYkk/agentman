@@ -31,7 +31,7 @@ use crate::docker::{ensure_workspace_writable, parse_memory_limit};
 use crate::inner_docker::start_dockerd_command;
 use crate::pty::{make_controlling_terminal, open_pty, PtyReader, PtyWriter};
 use crate::runtime::{
-    DestroyOptions, DestroyResult, ExecOutput, ExecProcess, ExecSpec, Resizer, SandboxStats,
+    KeyedLocks, DestroyOptions, DestroyResult, ExecOutput, ExecProcess, ExecSpec, Resizer, SandboxStats,
     SandboxStatus,
 };
 use crate::state::{StateManager, WorkspaceInfo};
@@ -41,6 +41,9 @@ const AGENTMAN_TAG: &str = "agentman";
 
 /// Where the workspace is mounted inside the container.
 const WORKSPACE_MOUNT: &str = "/workspace";
+
+/// The image's ENV inside the template, written by scripts/build-lxc-template.sh.
+const IMAGE_ENV_FILE: &str = "/etc/agentman/image.env";
 
 /// Tag marking containers created with Docker-in-sandbox (the LXC analogue of the
 /// `agentman.inner_docker` Docker label).
@@ -287,6 +290,29 @@ fn value_u64(v: &Value) -> Option<u64> {
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
+/// Parse a `KEY=VALUE` file (systemd EnvironmentFile style: blank lines and `#` comments are
+/// skipped, a value wrapped in matching quotes is unquoted).
+fn parse_env_file(content: &str) -> Vec<String> {
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let (key, value) = l.split_once('=')?;
+            let key = key.trim();
+            if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return None;
+            }
+            let value = value
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+                .unwrap_or(value);
+            Some(format!("{key}={value}"))
+        })
+        .collect()
+}
+
 /// Merge environment lists (`KEY=VALUE`); later entries override earlier ones.
 fn merge_env(lists: &[&[String]]) -> Vec<String> {
     let mut order: Vec<String> = Vec::new();
@@ -440,6 +466,7 @@ pub struct ProxmoxManager {
     container_env: RwLock<HashMap<String, Vec<String>>>,
     /// Whether new containers run their own Docker daemon (`docker_in_sandbox.mode != off`).
     inner_docker: bool,
+    create_locks: KeyedLocks,
 }
 
 impl ProxmoxManager {
@@ -488,6 +515,7 @@ impl ProxmoxManager {
             state,
             container_env: RwLock::new(HashMap::new()),
             inner_docker,
+            create_locks: KeyedLocks::default(),
         })
     }
 
@@ -572,6 +600,12 @@ impl ProxmoxManager {
         let workspace_path = self.config.workspace_path(github_user, project);
         ensure_workspace_writable(&workspace_path, self.config.workspace_owner()).await?;
 
+        // A second connection waits for an in-flight create instead of racing it.
+        let _create_guard = self
+            .create_locks
+            .lock(&format!("{github_user}/{project}"))
+            .await;
+
         if let Some(workspace) = self.state.get_workspace(github_user, project).await {
             if workspace.runtime != RuntimeKind::Proxmox {
                 warn!(
@@ -598,14 +632,50 @@ impl ProxmoxManager {
         self.create_container(github_user, project).await
     }
 
+    /// Record the container's environment: the image's ENV (written into the template by
+    /// scripts/build-lxc-template.sh) plus the agentman variables. Sessions attach with
+    /// `--clear-env`, so this is what Docker would have put in the container config.
     async fn remember_env(&self, vmid: &str, github_user: &str, project: &str, name: &str) {
-        let env = vec![
+        if self.container_env.read().await.contains_key(vmid) {
+            return;
+        }
+        let mut env = self.read_image_env(vmid).await;
+        env.extend([
             format!("GITHUB_USERNAME={}", github_user),
             format!("AGENTMAN_PROJECT={}", project),
             format!("AGENTMAN_CONTAINER_ID={}", name),
             "TERM=xterm-256color".to_string(),
-        ];
+        ]);
         self.container_env.write().await.insert(vmid.to_string(), env);
+    }
+
+    async fn read_image_env(&self, vmid: &str) -> Vec<String> {
+        let run = Command::new(self.lxc_tool("lxc-attach"))
+            .args(["-n", vmid, "--clear-env", "--", "cat", IMAGE_ENV_FILE])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        match tokio::time::timeout(Duration::from_secs(15), run).await {
+            Ok(Ok(out)) if out.status.success() => {
+                parse_env_file(&String::from_utf8_lossy(&out.stdout))
+            }
+            Ok(Ok(_)) => {
+                warn!(
+                    "Container {} has no {}; sessions get only proxmox.exec_env (rebuild the template with scripts/build-lxc-template.sh)",
+                    vmid, IMAGE_ENV_FILE
+                );
+                Vec::new()
+            }
+            Ok(Err(e)) => {
+                warn!("Failed to read {} in container {}: {}", IMAGE_ENV_FILE, vmid, e);
+                Vec::new()
+            }
+            Err(_) => {
+                warn!("Timed out reading {} in container {}", IMAGE_ENV_FILE, vmid);
+                Vec::new()
+            }
+        }
     }
 
     async fn ensure_running(&self, ct: &CtInfo) -> Result<()> {
@@ -671,14 +741,6 @@ impl ProxmoxManager {
             ("swap", pcfg.swap_mb.to_string()),
             ("net0", net0),
             ("unprivileged", if pcfg.unprivileged { "1" } else { "0" }.to_string()),
-            (
-                "tags",
-                if self.inner_docker {
-                    format!("{AGENTMAN_TAG};{INNER_DOCKER_TAG}")
-                } else {
-                    AGENTMAN_TAG.to_string()
-                },
-            ),
             (
                 "description",
                 format!("Managed by agentman for {github_user}/{project}"),
@@ -750,11 +812,23 @@ impl ProxmoxManager {
             return Err(e.context(format!("Failed to create container {hostname}")));
         }
 
-        // Bind mount the persistent workspace and set feature flags. Proxmox only lets root@pam
-        // add bind mounts and change features other than nesting, which API tokens cannot do,
-        // so this goes through `pct` on the node.
+        // Bind mount the persistent workspace, set feature flags and tags. Proxmox only lets
+        // root@pam add bind mounts and change features other than nesting, and checks tags
+        // against /vms/<id> (which a pool-scoped token lacks), so this goes through `pct`.
         let mp0 = format!("{},mp={}", workspace_path.display(), WORKSPACE_MOUNT);
-        let mut pct_args = vec!["set", vmid.as_str(), "--mp0", mp0.as_str()];
+        let tags = if self.inner_docker {
+            format!("{AGENTMAN_TAG};{INNER_DOCKER_TAG}")
+        } else {
+            AGENTMAN_TAG.to_string()
+        };
+        let mut pct_args = vec![
+            "set",
+            vmid.as_str(),
+            "--mp0",
+            mp0.as_str(),
+            "--tags",
+            tags.as_str(),
+        ];
         let features = self.pcfg().features(self.inner_docker);
         if let Some(ref features) = features {
             pct_args.extend(["--features", features.as_str()]);
@@ -764,7 +838,7 @@ impl ProxmoxManager {
             if let Err(e2) = self.delete_ct(&vmid).await {
                 warn!("Cleanup of container {} failed: {:#}", vmid, e2);
             }
-            return Err(e.context("Failed to configure the container (bind mount/features)"));
+            return Err(e.context("Failed to configure the container (bind mount/features/tags)"));
         }
 
         let upid = self
@@ -1217,5 +1291,21 @@ mod tests {
         );
         assert_eq!(api_error_message("plain failure"), "plain failure");
         assert_eq!(api_error_message(r#"{"data": null}"#), "");
+    }
+
+    #[test]
+    fn parses_image_env_file() {
+        let env = parse_env_file(
+            "# comment\nMISE_DATA_DIR=/home/agent/.local/share/mise\n\nPATH=/a:/b\nQ=\"x y\"\nbad line\n=nokey\nEMPTY=\n",
+        );
+        assert_eq!(
+            env,
+            vec![
+                "MISE_DATA_DIR=/home/agent/.local/share/mise",
+                "PATH=/a:/b",
+                "Q=x y",
+                "EMPTY=",
+            ]
+        );
     }
 }

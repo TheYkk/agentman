@@ -189,12 +189,11 @@ async fn bridge_agent_forwarding(sock: UnixStream, channel: Channel<Msg>) -> Res
 fn exec_env(tty: bool, term: &str, ssh_auth_sock: Option<&str>) -> Vec<String> {
     // Keep this small and non-invasive:
     // - Zed (and other editors) probe `$SHELL` over non-PTY exec sessions.
-    // - Some clients run `cd; ...` which fails if HOME is missing.
+    // - HOME stays the image user's home (tools like herdr and mise keep state there);
+    //   sessions still start in /workspace.
     let mut env = vec!["SHELL=/bin/bash".to_string()];
     if tty {
         env.push(format!("TERM={}", term));
-    } else {
-        env.push("HOME=/workspace".to_string());
     }
     if let Some(sock) = ssh_auth_sock {
         env.push(format!("SSH_AUTH_SOCK={}", sock));

@@ -32,7 +32,7 @@ use tracing::{info, warn};
 use crate::config::{DockerInSandboxMode, DockerIsolation, GatewayConfig, RuntimeKind};
 use crate::inner_docker;
 use crate::runtime::{
-    DestroyOptions, DestroyResult, ExecOutput, ExecProcess, ExecSpec, Resizer, SandboxStats,
+    KeyedLocks, DestroyOptions, DestroyResult, ExecOutput, ExecProcess, ExecSpec, Resizer, SandboxStats,
     SandboxStatus,
 };
 use crate::state::{StateManager, WorkspaceInfo};
@@ -188,6 +188,7 @@ pub struct ContainerManager {
     config: Arc<GatewayConfig>,
     state: Arc<StateManager>,
     inner_docker: InnerDocker,
+    create_locks: KeyedLocks,
 }
 
 impl ContainerManager {
@@ -233,6 +234,7 @@ impl ContainerManager {
             config,
             state,
             inner_docker,
+            create_locks: KeyedLocks::default(),
         })
     }
 
@@ -247,6 +249,13 @@ impl ContainerManager {
         // Ensure the host workspace directory is writable by the container user (needed for Zed/VS Code bootstraps).
         let workspace_path = self.config.workspace_path(github_user, project);
         ensure_workspace_writable(&workspace_path, self.config.workspace_owner()).await?;
+
+        // A second connection waits for an in-flight create (e.g. a slow image unpack) instead
+        // of racing it for the same container name.
+        let _create_guard = self
+            .create_locks
+            .lock(&format!("{github_user}/{project}"))
+            .await;
 
         // Check if we already have a container for this workspace
         if let Some(workspace) = self.state.get_workspace(github_user, project).await {
@@ -271,8 +280,78 @@ impl ContainerManager {
             );
         }
 
+        // A create that outlived its session or the gateway may have left a container behind
+        // that the state file never recorded; reuse it rather than reserving a new name.
+        if let Some(found) = self.find_untracked_container(github_user, project).await? {
+            return self.adopt_container(github_user, project, found).await;
+        }
+
         // Create new container
         self.create_container(github_user, project).await
+    }
+
+    /// The newest managed container labeled with this workspace, if any: (id, name, created).
+    async fn find_untracked_container(
+        &self,
+        github_user: &str,
+        project: &str,
+    ) -> Result<Option<(String, String, Option<i64>)>> {
+        let filters: HashMap<String, Vec<String>> = HashMap::from([(
+            "label".to_string(),
+            vec![
+                "agentman.managed=true".to_string(),
+                format!("agentman.github_user={}", github_user),
+                format!("agentman.project={}", project),
+            ],
+        )]);
+        let options = ListContainersOptionsBuilder::new()
+            .all(true)
+            .filters(&filters)
+            .build();
+        let mut containers = self
+            .docker
+            .list_containers(Some(options))
+            .await
+            .context("Failed to list containers")?;
+        containers.sort_by_key(|c| std::cmp::Reverse(c.created.unwrap_or(0)));
+        Ok(containers.into_iter().find_map(|c| {
+            let id = c.id?;
+            let name = c
+                .names
+                .and_then(|n| n.into_iter().next())
+                .map(|n| n.trim_start_matches('/').to_string())
+                .unwrap_or_else(|| id.clone());
+            Some((id, name, c.created))
+        }))
+    }
+
+    /// Start a container found by [`Self::find_untracked_container`] and record it in state.
+    async fn adopt_container(
+        &self,
+        github_user: &str,
+        project: &str,
+        (container_id, container_name, created): (String, String, Option<i64>),
+    ) -> Result<String> {
+        warn!(
+            "Reusing untracked container {} for {}/{}",
+            container_name, github_user, project
+        );
+        self.ensure_running(&container_id).await?;
+        self.ensure_inner_dockerd(&container_id).await;
+        self.state
+            .set_workspace(WorkspaceInfo {
+                github_user: github_user.to_string(),
+                project: project.to_string(),
+                runtime: RuntimeKind::Docker,
+                container_name,
+                container_id: Some(container_id.clone()),
+                created_at: created
+                    .and_then(|t| DateTime::from_timestamp(t, 0))
+                    .unwrap_or_else(Utc::now),
+                host_workspace_path: self.config.workspace_path(github_user, project),
+            })
+            .await?;
+        Ok(container_id)
     }
 
     /// Create a new container for the given user and project.
@@ -338,11 +417,34 @@ impl ContainerManager {
             .name(&container_name)
             .build();
 
-        let response = self
-            .docker
-            .create_container(Some(options), config)
-            .await
-            .with_context(|| format!("Failed to create container {}", container_name))?;
+        let response = match self.docker.create_container(Some(options), config).await {
+            Ok(r) => r,
+            // The name is still reserved by a create the daemon has not finished (e.g. one left
+            // over from before a gateway restart). Wait for that container to appear and reuse it.
+            Err(BollardError::DockerResponseServerError {
+                status_code: 409, ..
+            }) => {
+                warn!(
+                    "Container name {} is reserved by an unfinished create; waiting for it",
+                    container_name
+                );
+                for _ in 0..60 {
+                    if let Some(found) = self.find_untracked_container(github_user, project).await? {
+                        return self.adopt_container(github_user, project, found).await;
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                return Err(anyhow!(
+                    "Container name {} is still reserved by an unfinished create; remove it with `docker rm -f {}`",
+                    container_name,
+                    container_name
+                ));
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("Failed to create container {}", container_name));
+            }
+        };
 
         let container_id = response.id;
         info!("Created container {} ({})", container_name, &container_id[..12]);

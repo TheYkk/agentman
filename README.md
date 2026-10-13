@@ -231,7 +231,7 @@ How it works:
 Setup:
 
 1. **Template.**
-   - *Proxmox VE 8.x (and 9.x):* build a regular container template from the image. It adds systemd as init, a DHCP client, and an `agentman.service` that runs the image's entrypoint:
+   - *Proxmox VE 8.x (and 9.x):* build a regular container template from the image. It adds systemd as init, a DHCP client, an `agentman.service` that runs the image's entrypoint, and saves the image's ENV to `/etc/agentman/image.env`, which the gateway applies to every session (templates without it get only `[proxmox] exec_env`):
      ```bash
      scripts/build-lxc-template.sh ghcr.io/theykk/agentman-base:latest agentman-base.tar.zst   # needs docker, jq, zstd
      scp agentman-base.tar.zst root@pve:/var/lib/vz/template/cache/
@@ -252,7 +252,7 @@ Setup:
    pveum user token add agentman@pve gateway --privsep 0   # prints the secret
    install -m 600 /dev/stdin /etc/agentman/proxmox-token <<< 'SECRET'
    ```
-   Set `pool = "agentman"` in `[proxmox]`: without it, Proxmox checks `VM.Allocate` on `/vms/<new id>` and a pool-scoped token cannot create containers. (The simpler alternative is one ACL on `/` with `PVEVMAdmin,PVEDatastoreUser,PVESDNUser`, which then covers every VM on the cluster.) Bind mounts and feature flags other than `nesting` are applied with `pct` as root on the node, because Proxmox refuses them for API tokens.
+   Set `pool = "agentman"` in `[proxmox]`: without it, Proxmox checks `VM.Allocate` on `/vms/<new id>` and a pool-scoped token cannot create containers. (The simpler alternative is one ACL on `/` with `PVEVMAdmin,PVEDatastoreUser,PVESDNUser`, which then covers every VM on the cluster.) Bind mounts, feature flags other than `nesting`, and tags are applied with `pct` as root on the node, because Proxmox refuses them for API tokens (or, for tags, checks them against `/vms/<id>` before the container is in the pool).
 3. **Config** (`/etc/agentman/gateway.toml`):
    ```toml
    runtime = "proxmox"

@@ -3,9 +3,10 @@
 //! The SSH layer talks to a [`Runtime`], which dispatches to either the Docker backend
 //! ([`ContainerManager`]) or the Proxmox LXC backend ([`ProxmoxManager`]).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -18,6 +19,24 @@ use crate::docker::ContainerManager;
 use crate::proxmox::ProxmoxManager;
 use crate::pty::PtyMaster;
 use crate::state::WorkspaceInfo;
+
+/// One async lock per key, used to serialize sandbox creation per workspace so a second
+/// connection waits for an in-flight create instead of racing it.
+#[derive(Default)]
+pub struct KeyedLocks(Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>);
+
+impl KeyedLocks {
+    pub async fn lock(&self, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key.to_string())
+            .or_default()
+            .clone();
+        lock.lock_owned().await
+    }
+}
 
 /// Options for destroying a workspace (container(s) + persistent data).
 #[derive(Debug, Clone, Copy)]

@@ -121,7 +121,8 @@ exec_uid = 1000
 exec_gid = 1000
 # Keep the user's supplementary groups (e.g. docker) via setpriv inside the container
 exec_init_groups = true
-# lxc-attach starts from a clean environment; these mirror the base image's ENV (incl. mise shims)
+# lxc-attach starts from a clean environment. Sessions get these, overridden by the image's ENV
+# that scripts/build-lxc-template.sh writes to /etc/agentman/image.env in the template.
 exec_env = [
     "HOME=/home/agent",
     "SHELL=/bin/bash",
