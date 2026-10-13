@@ -1,0 +1,15 @@
+[Unit]
+Description=Agentman SSH Gateway (Proxmox LXC runtime)
+Documentation=https://github.com/TheYkk/agentman
+After=network.target pve-cluster.service pveproxy.service
+Wants=pveproxy.service
+
+[Service]
+Type=simple
+# Runs as root on the Proxmox node: `pct` and `lxc-attach` need it.
+ExecStart=/usr/local/bin/agentman-gateway -c /etc/agentman/gateway.toml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

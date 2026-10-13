@@ -98,6 +98,172 @@ pub struct GatewayConfig {
     /// Container security configuration
     #[serde(default)]
     pub container_security: ContainerSecurityConfig,
+
+    /// Which runtime provisions sandboxes: Docker containers or Proxmox LXC containers.
+    #[serde(default)]
+    pub runtime: RuntimeKind,
+
+    /// Proxmox VE settings (used when `runtime = "proxmox"`).
+    #[serde(default)]
+    pub proxmox: ProxmoxConfig,
+}
+
+/// Sandbox runtime backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeKind {
+    /// Docker containers via the local Docker daemon.
+    #[default]
+    Docker,
+    /// LXC containers on a Proxmox VE node.
+    Proxmox,
+}
+
+impl std::fmt::Display for RuntimeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Docker => f.write_str("docker"),
+            Self::Proxmox => f.write_str("proxmox"),
+        }
+    }
+}
+
+/// Proxmox VE (LXC) runtime configuration.
+///
+/// The gateway must run as root on the Proxmox node that hosts the containers: lifecycle
+/// operations go through the Proxmox VE API, while shells are attached with `lxc-attach`,
+/// pause/resume use `lxc-freeze`/`lxc-unfreeze`, and the workspace bind mount is configured
+/// with `pct` (Proxmox only lets `root@pam` configure bind mounts, which API tokens cannot do).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProxmoxConfig {
+    /// Base URL of the Proxmox VE API (without `/api2/json`).
+    pub api_url: String,
+
+    /// Node that hosts agent containers. Empty means the local hostname.
+    pub node: String,
+
+    /// API token id, e.g. `agentman@pve!gateway`.
+    pub token_id: String,
+
+    /// File containing the API token secret. The `AGENTMAN_PROXMOX_TOKEN_SECRET`
+    /// environment variable takes precedence when set.
+    pub token_secret_file: Option<PathBuf>,
+
+    /// PEM CA certificate used to verify the API's TLS certificate.
+    /// Defaults to the cluster CA that every Proxmox node has.
+    pub ca_cert: Option<PathBuf>,
+
+    /// Skip TLS verification of the API (only for testing).
+    pub insecure_skip_tls_verify: bool,
+
+    /// Container template volume, e.g. `local:vztmpl/agentman-base.tar.zst`.
+    /// On Proxmox VE 9.1+ this can also be an OCI image archive.
+    pub ostemplate: String,
+
+    /// Storage for the container root filesystem.
+    pub storage: String,
+
+    /// Root filesystem size in GiB.
+    pub rootfs_size_gb: u32,
+
+    /// Memory in MiB when `container_security.memory_limit` is not set.
+    pub default_memory_mb: u64,
+
+    /// Swap in MiB.
+    pub swap_mb: u64,
+
+    /// Network bridge for `net0`.
+    pub bridge: String,
+
+    /// IPv4 config for `net0` (`dhcp` or CIDR like `10.0.0.5/24`).
+    pub ip: String,
+
+    /// Optional IPv4 gateway for `net0` (when `ip` is static).
+    pub gateway: Option<String>,
+
+    /// Optional resource pool to place containers in.
+    pub pool: Option<String>,
+
+    /// Create unprivileged containers (recommended).
+    pub unprivileged: bool,
+
+    /// Enable the `nesting` feature (needed by systemd in recent distros and by docker-in-LXC).
+    pub nesting: bool,
+
+    /// Host UID/GID offset for unprivileged containers (Proxmox default: 100000).
+    pub id_map_offset: u32,
+
+    /// UID that shells run as inside the container.
+    pub exec_uid: u32,
+
+    /// GID that shells run as inside the container.
+    pub exec_gid: u32,
+
+    /// Base environment for shells inside the container (`lxc-attach` starts from a clean env).
+    pub exec_env: Vec<String>,
+
+    /// Directory with the LXC tools (`lxc-attach`, `lxc-info`, `lxc-freeze`, `lxc-unfreeze`).
+    pub lxc_bin_dir: PathBuf,
+
+    /// Path to `pct`.
+    pub pct_path: PathBuf,
+}
+
+impl Default for ProxmoxConfig {
+    fn default() -> Self {
+        Self {
+            api_url: "https://127.0.0.1:8006".to_string(),
+            node: String::new(),
+            token_id: "agentman@pve!gateway".to_string(),
+            token_secret_file: Some(PathBuf::from("/etc/agentman/proxmox-token")),
+            ca_cert: Some(PathBuf::from("/etc/pve/pve-root-ca.pem")),
+            insecure_skip_tls_verify: false,
+            ostemplate: "local:vztmpl/agentman-base.tar".to_string(),
+            storage: "local-lvm".to_string(),
+            rootfs_size_gb: 16,
+            default_memory_mb: 4096,
+            swap_mb: 512,
+            bridge: "vmbr0".to_string(),
+            ip: "dhcp".to_string(),
+            gateway: None,
+            pool: None,
+            unprivileged: true,
+            nesting: true,
+            id_map_offset: 100_000,
+            // Matches the user baked into the base image (see Dockerfile: USERNAME/USER_UID/USER_GID).
+            exec_uid: 1000,
+            exec_gid: 1000,
+            exec_env: vec![
+                "HOME=/home/agent".to_string(),
+                "USER=agent".to_string(),
+                "LOGNAME=agent".to_string(),
+                "LANG=C.UTF-8".to_string(),
+                "BUN_INSTALL=/usr/local/bun".to_string(),
+                "GOPATH=/home/agent/go".to_string(),
+                "JAVA_HOME=/home/agent/.sdkman/candidates/java/current".to_string(),
+                "PATH=/home/agent/.cargo/bin:/home/agent/.local/bin:/home/agent/go/bin:/usr/local/go/bin:/usr/local/bun/bin:/usr/local/node/bin:/home/agent/.sdkman/candidates/java/current/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+            ],
+            lxc_bin_dir: PathBuf::from("/usr/bin"),
+            pct_path: PathBuf::from("/usr/sbin/pct"),
+        }
+    }
+}
+
+impl ProxmoxConfig {
+    /// UID/GID on the host that maps to the container's exec user.
+    ///
+    /// Used to make bind-mounted workspaces and sockets writable from inside the container.
+    pub fn host_owner(&self) -> (u32, u32) {
+        if self.unprivileged {
+            (
+                self.id_map_offset + self.exec_uid,
+                self.id_map_offset + self.exec_gid,
+            )
+        } else {
+            (self.exec_uid, self.exec_gid)
+        }
+    }
 }
 
 impl Default for GatewayConfig {
@@ -117,6 +283,8 @@ impl Default for GatewayConfig {
             agent_forwarding: AgentForwardingConfig::default(),
             shell: ShellConfig::default(),
             container_security: ContainerSecurityConfig::default(),
+            runtime: RuntimeKind::default(),
+            proxmox: ProxmoxConfig::default(),
         }
     }
 }
@@ -248,8 +416,38 @@ impl GatewayConfig {
         Ok(())
     }
 
+    /// UID/GID on the host that should own workspace directories and forwarded sockets.
+    pub fn workspace_owner(&self) -> (u32, u32) {
+        match self.runtime {
+            // Matches the default user baked into the base image (see Dockerfile: USER_UID/USER_GID).
+            RuntimeKind::Docker => (1000, 1000),
+            RuntimeKind::Proxmox => self.proxmox.host_owner(),
+        }
+    }
+
     /// Get the workspace path for a given GitHub user and project.
     pub fn workspace_path(&self, github_user: &str, project: &str) -> PathBuf {
         self.workspace_root.join(github_user).join(project)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn example_config_parses() {
+        let content = include_str!("../examples/gateway.toml");
+        let config: GatewayConfig = toml::from_str(content).unwrap();
+        assert_eq!(config.runtime, RuntimeKind::Docker);
+        assert_eq!(config.workspace_owner(), (1000, 1000));
+        assert_eq!(config.proxmox.token_id, "agentman@pve!gateway");
+    }
+
+    #[test]
+    fn proxmox_runtime_shifts_workspace_owner() {
+        let config: GatewayConfig = toml::from_str("runtime = \"proxmox\"\n").unwrap();
+        assert_eq!(config.runtime, RuntimeKind::Proxmox);
+        assert_eq!(config.workspace_owner(), (101000, 101000));
     }
 }

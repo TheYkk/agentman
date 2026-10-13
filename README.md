@@ -20,7 +20,7 @@ Python is installed using uv per the official guide: `https://docs.astral.sh/uv/
 The **agentman-gateway** is a Rust SSH server that provides streamlined access to agent containers. It automatically:
 
 - Authenticates users via SSH public keys (verified against GitHub)
-- Creates/manages Docker containers per project
+- Creates/manages a container per project (Docker, or LXC on Proxmox VE; see [Running on Proxmox VE](#running-on-proxmox-ve-lxc))
 - Persists `/workspace` across sessions
 - Supports port forwarding for development workflows
 
@@ -214,6 +214,48 @@ Containers are created with security hardening by default:
 - **Isolated networking**: Bridge network only, no host network
 
 The `/workspace` bind-mount is the only host path exposed to containers.
+
+### Running on Proxmox VE (LXC)
+
+Instead of Docker, the gateway can run each sandbox as an **LXC container on Proxmox VE**. Set `runtime = "proxmox"` and fill in the `[proxmox]` section. Everything else (SSH auth, tmux sessions, port/agent forwarding, `agentman list/stop/pause/stats/destroy`) works the same.
+
+How it works:
+- The gateway runs **as root on the Proxmox node** that hosts the containers.
+- Lifecycle (create, start, shutdown, destroy, status, stats) goes through the **Proxmox VE API** with an API token.
+- The workspace is bind-mounted at `/workspace` with `pct set <vmid> --mp0 ...` (Proxmox only lets `root@pam` add bind mounts, which API tokens cannot do).
+- Shells and commands are attached with `lxc-attach`, running as UID/GID 1000 (`exec_uid`/`exec_gid`). Interactive sessions get a real PTY and follow window resizes.
+- `agentman pause` freezes the container with `lxc-freeze`; reconnecting unfreezes it.
+- Containers are unprivileged by default, so the gateway chowns workspaces to the shifted host UID (`id_map_offset + exec_uid`, i.e. `101000`).
+
+Setup:
+
+1. **Template.** On Proxmox VE 9.1+, pull the base image as an OCI template (Datacenter → Storage → CT Templates → *Pull from OCI Registry*, e.g. `ghcr.io/theykk/agentman-base:latest`) and set `ostemplate` to the resulting volume (for example `local:vztmpl/agentman-base_latest.tar`). Any LXC template works as long as it has a user with UID 1000 and the tools you need (`bash`, `tmux`, `socat` for `ssh -L`).
+2. **API token.** Create a user and token with enough rights to manage containers:
+   ```bash
+   pveum user add agentman@pve
+   pveum acl modify / --users agentman@pve --roles PVEVMAdmin,PVEDatastoreUser,PVESDNUser
+   pveum user token add agentman@pve gateway --privsep 0   # prints the secret
+   install -m 600 /dev/stdin /etc/agentman/proxmox-token <<< 'SECRET'
+   ```
+3. **Config** (`/etc/agentman/gateway.toml`):
+   ```toml
+   runtime = "proxmox"
+
+   [proxmox]
+   api_url = "https://127.0.0.1:8006"
+   token_id = "agentman@pve!gateway"
+   token_secret_file = "/etc/agentman/proxmox-token"  # or AGENTMAN_PROXMOX_TOKEN_SECRET
+   ca_cert = "/etc/pve/pve-root-ca.pem"              # the cluster CA every node has
+   ostemplate = "local:vztmpl/agentman-base_latest.tar"
+   storage = "local-lvm"
+   rootfs_size_gb = 16
+   bridge = "vmbr0"
+   ip = "dhcp"
+   ```
+   `container_security.memory_limit` and `cpu_limit` map to the container's memory and cores/cpulimit; without a memory limit, `default_memory_mb` (4096) is used.
+4. **Service.** Use `gateway/examples/agentman-gateway-proxmox.service` (it runs as root without the Docker-specific sandboxing, since `pct` and `lxc-attach` need it).
+
+Limitations: `ssh -R` listeners bind on the Proxmox host, and there is no `host.docker.internal` alias inside LXC containers. Docker's capability/seccomp settings in `[container_security]` do not apply; LXC containers use Proxmox's AppArmor profile and user namespaces instead. Workspaces created under one runtime are not reused by the other; switching runtimes provisions a fresh container on the same workspace directory.
 
 ### Container Naming
 

@@ -13,8 +13,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use bollard::exec::StartExecResults;
-use bollard::container::LogOutput;
 use chrono::Utc;
 use futures::StreamExt;
 use russh::server::{Auth, Handler, Msg, Session};
@@ -27,7 +25,6 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::config::{GatewayConfig, ShellMode};
-use crate::docker::ContainerManager;
 use crate::gateway_control::{
     execute_gateway_control_command, parse_gateway_control_command, render_sandbox_stats_fast,
     GatewayControlExecution,
@@ -36,13 +33,14 @@ use crate::github::{
     compute_fingerprint_from_pubkey, parse_ssh_username, public_key_to_openssh,
     validate_github_username, validate_project_name, GitHubKeyFetcher,
 };
+use crate::runtime::{ExecOutput, ExecSpec, Resizer, Runtime};
 use crate::state::{KeyCacheEntry, StateManager};
 
 /// Shared state for the SSH server.
 pub struct ServerState {
     pub config: Arc<GatewayConfig>,
     pub state: Arc<StateManager>,
-    pub container_manager: Arc<ContainerManager>,
+    pub runtime: Arc<Runtime>,
     pub github_fetcher: Arc<GitHubKeyFetcher>,
 }
 
@@ -63,7 +61,7 @@ pub struct ConnectionHandler {
     /// Container ID (after provisioning).
     container_id: Option<String>,
 
-    /// Active exec sessions (channel_id -> exec_id).
+    /// Active exec sessions (channel_id -> exec session).
     exec_sessions: HashMap<ChannelId, ExecSession>,
 
     /// Active gateway-control watch sessions (channel_id -> cancelled flag).
@@ -87,10 +85,12 @@ pub struct ConnectionHandler {
 }
 
 struct ExecSession {
-    exec_id: String,
+    resizer: Resizer,
     tty: bool,
     /// Channel for sending data to the container.
     stdin_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// Task bridging the process I/O to the SSH channel.
+    io_task: tokio::task::AbortHandle,
 }
 
 #[derive(Debug, Clone)]
@@ -548,8 +548,8 @@ impl Handler for ConnectionHandler {
         // Get or create container
         let container_id = self
             .server
-            .container_manager
-            .get_or_create_container(github_user, project)
+            .runtime
+            .get_or_create_sandbox(github_user, project)
             .await?;
 
         self.container_id = Some(container_id.clone());
@@ -583,23 +583,18 @@ impl Handler for ConnectionHandler {
             }
         };
 
-        // Create exec in container
-        let exec_id = self
-            .server
-            .container_manager
-            .create_exec(
-                &container_id,
-                cmd,
-                tty,
-                Some(exec_env(tty, term, ssh_auth_sock.as_deref())),
-            )
-            .await?;
+        let spec = ExecSpec {
+            cmd,
+            tty,
+            env: exec_env(tty, term, ssh_auth_sock.as_deref()),
+            size: self.pty_size(channel_id),
+        };
 
-        // Start exec and connect to channel
+        // Start the process in the container and connect it to the channel
         self.start_exec_session(
             channel_id,
-            exec_id.clone(),
-            tty,
+            &container_id,
+            spec,
             ChannelStreamKind::Session,
             session,
         )
@@ -607,18 +602,6 @@ impl Handler for ConnectionHandler {
 
         // Confirm the shell request was accepted (client may be waiting on this).
         session.channel_success(channel_id)?;
-
-        // Resize to stored PTY dimensions
-        if let Some(pty) = self.ptys.get(&channel_id) {
-            if let Err(e) = self
-                .server
-                .container_manager
-                .resize_exec(&exec_id, pty.cols as u16, pty.rows as u16)
-                .await
-            {
-                warn!("Failed to set initial exec size: {}", e);
-            }
-        }
 
         Ok(())
     }
@@ -647,7 +630,7 @@ impl Handler for ConnectionHandler {
         if let Some(ctrl) = parse_gateway_control_command(command.trim()) {
             let res = execute_gateway_control_command(
                 ctrl,
-                self.server.container_manager.as_ref(),
+                self.server.runtime.as_ref(),
                 github_user,
                 project,
             )
@@ -677,7 +660,7 @@ impl Handler for ConnectionHandler {
                     return Ok(());
                 }
                 GatewayControlExecution::WatchStats { current, interval } => {
-                    let cm = self.server.container_manager.clone();
+                    let cm = self.server.runtime.clone();
                     let github_user = github_user.to_string();
                     let project = project.to_string();
 
@@ -752,8 +735,8 @@ impl Handler for ConnectionHandler {
         // Get or create container
         let container_id = self
             .server
-            .container_manager
-            .get_or_create_container(github_user, project)
+            .runtime
+            .get_or_create_sandbox(github_user, project)
             .await?;
 
         self.container_id = Some(container_id.clone());
@@ -768,25 +751,20 @@ impl Handler for ConnectionHandler {
             .as_ref()
             .map(|a| a.ssh_auth_sock_in_container());
 
-        // Create exec in container
-        let exec_id = self
-            .server
-            .container_manager
-            .create_exec(
-                &container_id,
-                // Exec requests should behave like standard sshd: don't force a login shell.
-                // This avoids user rc files (e.g. tmux auto-attach) breaking editor bootstrap flows.
-                vec!["/bin/bash".to_string(), "-c".to_string(), command],
-                tty,
-                Some(exec_env(tty, term, ssh_auth_sock.as_deref())),
-            )
-            .await?;
+        let spec = ExecSpec {
+            // Exec requests should behave like standard sshd: don't force a login shell.
+            // This avoids user rc files (e.g. tmux auto-attach) breaking editor bootstrap flows.
+            cmd: vec!["/bin/bash".to_string(), "-c".to_string(), command],
+            tty,
+            env: exec_env(tty, term, ssh_auth_sock.as_deref()),
+            size: self.pty_size(channel_id),
+        };
 
-        // Start exec and connect to channel
+        // Start the process in the container and connect it to the channel
         self.start_exec_session(
             channel_id,
-            exec_id.clone(),
-            tty,
+            &container_id,
+            spec,
             ChannelStreamKind::Session,
             session,
         )
@@ -794,18 +772,6 @@ impl Handler for ConnectionHandler {
 
         // Confirm the exec request was accepted (OpenSSH sets want-reply=true).
         session.channel_success(channel_id)?;
-
-        // Resize to stored PTY dimensions
-        if let Some(pty) = self.ptys.get(&channel_id) {
-            if let Err(e) = self
-                .server
-                .container_manager
-                .resize_exec(&exec_id, pty.cols as u16, pty.rows as u16)
-                .await
-            {
-                warn!("Failed to set initial exec size: {}", e);
-            }
-        }
 
         Ok(())
     }
@@ -834,10 +800,9 @@ impl Handler for ConnectionHandler {
             if !exec_session.tty {
                 return Ok(());
             }
-            if let Err(e) = self
-                .server
-                .container_manager
-                .resize_exec(&exec_session.exec_id, col_width as u16, row_height as u16)
+            if let Err(e) = exec_session
+                .resizer
+                .resize(col_width as u16, row_height as u16)
                 .await
             {
                 warn!("Failed to resize exec: {}", e);
@@ -898,26 +863,31 @@ impl Handler for ConnectionHandler {
             )
         })?;
 
-        // Make the socket usable from the container user (UID/GID 1000 in the base image).
+        // Make the socket usable from the container user (as seen from the host).
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
 
+            let (uid, gid) = self.server.config.workspace_owner();
             let mut chowned = false;
             match Command::new("chown")
-                .arg("1000:1000")
+                .arg(format!("{uid}:{gid}"))
                 .arg(&socket_host_path)
                 .status()
                 .await
             {
                 Ok(status) if status.success() => chowned = true,
                 Ok(status) => warn!(
-                    "chown 1000:1000 {} exited with status {}",
+                    "chown {}:{} {} exited with status {}",
+                    uid,
+                    gid,
                     socket_host_path.display(),
                     status
                 ),
                 Err(e) => warn!(
-                    "Failed to run chown 1000:1000 {}: {}",
+                    "Failed to run chown {}:{} {}: {}",
+                    uid,
+                    gid,
                     socket_host_path.display(),
                     e
                 ),
@@ -1036,7 +1006,9 @@ impl Handler for ConnectionHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         debug!("Channel closed: {:?}", channel_id);
-        self.exec_sessions.remove(&channel_id);
+        if let Some(exec_session) = self.exec_sessions.remove(&channel_id) {
+            exec_session.io_task.abort();
+        }
         if let Some(cancelled) = self.watch_sessions.remove(&channel_id) {
             cancelled.store(true, Ordering::Relaxed);
         }
@@ -1097,8 +1069,8 @@ impl Handler for ConnectionHandler {
             None => {
                 let id = self
                     .server
-                    .container_manager
-                    .get_or_create_container(github_user, project)
+                    .runtime
+                    .get_or_create_sandbox(github_user, project)
                     .await?;
                 self.container_id = Some(id.clone());
                 id
@@ -1125,15 +1097,22 @@ impl Handler for ConnectionHandler {
             format!("TCP:{}:{}", dest_host, port_to_connect),
         ];
 
-        let exec_id = self
-            .server
-            .container_manager
-            .create_exec(&container_id, cmd, false, None)
-            .await?;
+        let spec = ExecSpec {
+            cmd,
+            tty: false,
+            env: Vec::new(),
+            size: None,
+        };
 
         // Treat direct-tcpip as a raw byte stream: no exit-status and no SSH stderr extended-data.
-        self.start_exec_session(channel.id(), exec_id, false, ChannelStreamKind::TcpForward, session)
-            .await?;
+        self.start_exec_session(
+            channel.id(),
+            &container_id,
+            spec,
+            ChannelStreamKind::TcpForward,
+            session,
+        )
+        .await?;
 
         Ok(true)
     }
@@ -1294,148 +1273,118 @@ impl ConnectionHandler {
         }
     }
 
-    /// Start an exec session and connect it to an SSH channel.
+    /// PTY size (cols, rows) requested for a channel, if any.
+    fn pty_size(&self, channel_id: ChannelId) -> Option<(u16, u16)> {
+        self.ptys
+            .get(&channel_id)
+            .map(|pty| (pty.cols as u16, pty.rows as u16))
+    }
+
+    /// Start a process in the sandbox and connect it to an SSH channel.
     async fn start_exec_session(
         &mut self,
         channel_id: ChannelId,
-        exec_id: String,
-        tty: bool,
+        sandbox_id: &str,
+        spec: ExecSpec,
         kind: ChannelStreamKind,
         session: &mut Session,
     ) -> Result<()> {
-        let docker = self.server.container_manager.docker().clone();
-
-        // Start the exec
-        let results = self
-            .server
-            .container_manager
-            .start_exec(&exec_id, tty)
-            .await?;
+        let tty = spec.tty;
+        let process = self.server.runtime.exec(sandbox_id, spec).await?;
+        let mut output = process.output;
+        let mut input = process.input;
+        let exit_status = process.exit_status;
 
         // Create channel for stdin
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(32);
-
-        self.exec_sessions.insert(
-            channel_id,
-            ExecSession {
-                exec_id: exec_id.clone(),
-                tty,
-                stdin_tx: Some(stdin_tx),
-            },
-        );
 
         // Get session handle for async operations
         let handle = session.handle();
 
         // Spawn task to handle the exec I/O
-        tokio::spawn(async move {
-            match results {
-                StartExecResults::Attached { mut output, mut input } => {
-                    // Task to forward stdin to container
-                    let stdin_task = async move {
-                        while let Some(data) = stdin_rx.recv().await {
-                            if input.write_all(&data).await.is_err() {
+        let io_task = tokio::spawn(async move {
+            // Task to forward stdin to container
+            let stdin_task = async move {
+                while let Some(data) = stdin_rx.recv().await {
+                    if input.write_all(&data).await.is_err() {
+                        break;
+                    }
+                    let _ = input.flush().await;
+                }
+            };
+
+            // Task to forward container output to SSH channel
+            let stdout_task = async move {
+                while let Some(output_result) = output.next().await {
+                    match output_result {
+                        Ok(ExecOutput::Stderr(message)) => {
+                            match kind {
+                                ChannelStreamKind::Session => {
+                                    // Keep stderr separate so tools like Zed can use stdout as a clean transport.
+                                    if handle
+                                        .extended_data(
+                                            channel_id,
+                                            1, // SSH_EXTENDED_DATA_STDERR
+                                            CryptoVec::from_slice(message.as_ref()),
+                                        )
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                ChannelStreamKind::TcpForward => {
+                                    // For TCP forwarding channels, do not send stderr as it would corrupt the byte stream.
+                                    // Log it server-side instead.
+                                    warn!(
+                                        "tcp-forward stderr (ignored): {}",
+                                        String::from_utf8_lossy(message.as_ref())
+                                    );
+                                }
+                            }
+                        }
+                        Ok(ExecOutput::Stdout(message)) => {
+                            if handle
+                                .data(channel_id, CryptoVec::from_slice(message.as_ref()))
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
-                    };
-
-                    // Task to forward container output to SSH channel
-                    let stdout_task = async move {
-                        while let Some(output_result) = output.next().await {
-                            match output_result {
-                                Ok(output) => {
-                                    match output {
-                                        LogOutput::StdErr { message } => {
-                                            match kind {
-                                                ChannelStreamKind::Session => {
-                                                    // Keep stderr separate so tools like Zed can use stdout as a clean transport.
-                                                    if handle
-                                                        .extended_data(
-                                                            channel_id,
-                                                            1, // SSH_EXTENDED_DATA_STDERR
-                                                            CryptoVec::from_slice(message.as_ref()),
-                                                        )
-                                                        .await
-                                                        .is_err()
-                                                    {
-                                                        break;
-                                                    }
-                                                }
-                                                ChannelStreamKind::TcpForward => {
-                                                    // For TCP forwarding channels, do not send stderr as it would corrupt the byte stream.
-                                                    // Log it server-side instead.
-                                                    warn!(
-                                                        "tcp-forward stderr (ignored): {}",
-                                                        String::from_utf8_lossy(message.as_ref())
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        LogOutput::StdOut { message }
-                                        | LogOutput::StdIn { message }
-                                        | LogOutput::Console { message } => {
-                                            if handle
-                                                .data(
-                                                    channel_id,
-                                                    CryptoVec::from_slice(message.as_ref()),
-                                                )
-                                                .await
-                                                .is_err()
-                                            {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("Exec output error: {}", e);
-                                    break;
-                                }
-                            }
+                        Err(e) => {
+                            warn!("Exec output error: {}", e);
+                            break;
                         }
-
-                        if kind == ChannelStreamKind::Session {
-                            // Capture exit status for clients (editors) that rely on it.
-                            // `inspect_exec` may briefly report Running=true even after the output stream ends,
-                            // so we poll for a short time.
-                            let mut exit_status: u32 = 255;
-                            for _ in 0..80 {
-                                match docker.inspect_exec(&exec_id).await {
-                                    Ok(info) => {
-                                        if info.running.unwrap_or(false) {
-                                            tokio::time::sleep(Duration::from_millis(25)).await;
-                                            continue;
-                                        }
-                                        let code = info.exit_code.unwrap_or(0);
-                                        exit_status = if code < 0 { 255 } else { code as u32 };
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to inspect exec {}: {}", exec_id, e);
-                                        break;
-                                    }
-                                }
-                            }
-
-                            let _ = handle.exit_status_request(channel_id, exit_status).await;
-                        }
-
-                        // Send EOF and close
-                        let _ = handle.eof(channel_id).await;
-                        let _ = handle.close(channel_id).await;
-                    };
-
-                    // Keep forwarding stdout even if the client closes stdin early (common for `ssh -T ... cmd`).
-                    let stdin_handle = tokio::spawn(stdin_task);
-                    stdout_task.await;
-                    stdin_handle.abort();
+                    }
                 }
-                StartExecResults::Detached => {
-                    warn!("Exec started in detached mode unexpectedly");
+
+                if kind == ChannelStreamKind::Session {
+                    // Capture exit status for clients (editors) that rely on it.
+                    let status = exit_status.await;
+                    let _ = handle.exit_status_request(channel_id, status).await;
                 }
-            }
+
+                // Send EOF and close
+                let _ = handle.eof(channel_id).await;
+                let _ = handle.close(channel_id).await;
+            };
+
+            // Keep forwarding stdout even if the client closes stdin early (common for `ssh -T ... cmd`).
+            let stdin_handle = tokio::spawn(stdin_task);
+            stdout_task.await;
+            stdin_handle.abort();
         });
+
+        self.exec_sessions.insert(
+            channel_id,
+            ExecSession {
+                resizer: process.resizer,
+                tty,
+                stdin_tx: Some(stdin_tx),
+                io_task: io_task.abort_handle(),
+            },
+        );
 
         Ok(())
     }
@@ -1470,7 +1419,7 @@ fn sanitize_tmux_session_name(name: &str) -> String {
 pub async fn run_server(
     config: Arc<GatewayConfig>,
     state: Arc<StateManager>,
-    container_manager: Arc<ContainerManager>,
+    runtime: Arc<Runtime>,
     github_fetcher: Arc<GitHubKeyFetcher>,
 ) -> Result<()> {
     // Load or generate host key
@@ -1486,7 +1435,7 @@ pub async fn run_server(
     let server_state = Arc::new(ServerState {
         config: config.clone(),
         state,
-        container_manager,
+        runtime,
         github_fetcher,
     });
 
