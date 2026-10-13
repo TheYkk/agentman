@@ -191,6 +191,12 @@ pub struct ProxmoxConfig {
     /// Enable the `nesting` feature (needed by systemd in recent distros and by docker-in-LXC).
     pub nesting: bool,
 
+    /// Enable the `keyctl` feature on unprivileged containers (needed to run Docker inside).
+    pub keyctl: bool,
+
+    /// Enable the `fuse` feature (for fuse-overlayfs or other FUSE filesystems inside).
+    pub fuse: bool,
+
     /// Host UID/GID offset for unprivileged containers (Proxmox default: 100000).
     pub id_map_offset: u32,
 
@@ -199,6 +205,11 @@ pub struct ProxmoxConfig {
 
     /// GID that shells run as inside the container.
     pub exec_gid: u32,
+
+    /// Give shells the exec user's supplementary groups from the container's `/etc/group`
+    /// (e.g. `docker`, so the user can reach the Docker socket). Requires `setpriv` and a
+    /// user with `exec_uid` inside the container.
+    pub exec_init_groups: bool,
 
     /// Base environment for shells inside the container (`lxc-attach` starts from a clean env).
     pub exec_env: Vec<String>,
@@ -230,10 +241,13 @@ impl Default for ProxmoxConfig {
             pool: None,
             unprivileged: true,
             nesting: true,
+            keyctl: true,
+            fuse: false,
             id_map_offset: 100_000,
             // Matches the user baked into the base image (see Dockerfile: USERNAME/USER_UID/USER_GID).
             exec_uid: 1000,
             exec_gid: 1000,
+            exec_init_groups: true,
             exec_env: vec![
                 "HOME=/home/agent".to_string(),
                 "USER=agent".to_string(),
@@ -251,6 +265,22 @@ impl Default for ProxmoxConfig {
 }
 
 impl ProxmoxConfig {
+    /// Value for the container's `features` option, if any feature is enabled.
+    pub fn features(&self) -> Option<String> {
+        let mut features = Vec::new();
+        if self.nesting {
+            features.push("nesting=1");
+        }
+        // keyctl only exists for unprivileged containers.
+        if self.keyctl && self.unprivileged {
+            features.push("keyctl=1");
+        }
+        if self.fuse {
+            features.push("fuse=1");
+        }
+        (!features.is_empty()).then(|| features.join(","))
+    }
+
     /// UID/GID on the host that maps to the container's exec user.
     ///
     /// Used to make bind-mounted workspaces and sockets writable from inside the container.

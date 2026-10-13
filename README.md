@@ -223,7 +223,8 @@ How it works:
 - The gateway runs **as root on the Proxmox node** that hosts the containers.
 - Lifecycle (create, start, shutdown, destroy, status, stats) goes through the **Proxmox VE API** with an API token.
 - The workspace is bind-mounted at `/workspace` with `pct set <vmid> --mp0 ...` (Proxmox only lets `root@pam` add bind mounts, which API tokens cannot do).
-- Shells and commands are attached with `lxc-attach`, running as UID/GID 1000 (`exec_uid`/`exec_gid`). Interactive sessions get a real PTY and follow window resizes.
+- Shells and commands are attached with `lxc-attach` and drop to UID/GID 1000 (`exec_uid`/`exec_gid`) with `setpriv --init-groups`, so the user keeps groups like `docker`. Interactive sessions get a real PTY and follow window resizes.
+- Containers are created with `features: nesting=1,keyctl=1`, which is what Docker needs to run inside an unprivileged LXC container (set `fuse = true` too if you use fuse-overlayfs).
 - `agentman pause` freezes the container with `lxc-freeze`; reconnecting unfreezes it.
 - Containers are unprivileged by default, so the gateway chowns workspaces to the shifted host UID (`id_map_offset + exec_uid`, i.e. `101000`).
 

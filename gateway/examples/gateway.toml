@@ -105,13 +105,18 @@ ip = "dhcp"
 # pool = "agentman"
 
 unprivileged = true
+# nesting + keyctl let Docker run inside unprivileged containers; fuse is optional.
 nesting = true
+keyctl = true
+fuse = false
 # Host UID/GID offset of unprivileged containers (workspaces are chowned to offset + exec_uid)
 id_map_offset = 100000
 
 # User that shells run as inside the container
 exec_uid = 1000
 exec_gid = 1000
+# Keep the user's supplementary groups (e.g. docker) via setpriv inside the container
+exec_init_groups = true
 # lxc-attach starts from a clean environment; these mirror the base image's ENV
 exec_env = [
     "HOME=/home/agent",

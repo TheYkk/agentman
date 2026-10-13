@@ -273,22 +273,32 @@ fn merge_env(lists: &[&[String]]) -> Vec<String> {
 
 /// Build the `lxc-attach` argument list for running `spec` in container `vmid`.
 fn lxc_attach_args(cfg: &ProxmoxConfig, vmid: &str, env: &[String], cmd: &[String]) -> Vec<String> {
-    let mut args = vec![
-        "-n".to_string(),
-        vmid.to_string(),
-        "--clear-env".to_string(),
-        "--uid".to_string(),
-        cfg.exec_uid.to_string(),
-        "--gid".to_string(),
-        cfg.exec_gid.to_string(),
-    ];
+    let mut args = vec!["-n".to_string(), vmid.to_string(), "--clear-env".to_string()];
+    if !cfg.exec_init_groups {
+        // lxc-attach switches user itself but drops supplementary groups.
+        args.extend([
+            "--uid".to_string(),
+            cfg.exec_uid.to_string(),
+            "--gid".to_string(),
+            cfg.exec_gid.to_string(),
+        ]);
+    }
     for kv in env {
         args.push("--set-var".to_string());
         args.push(kv.clone());
     }
+    args.push("--".to_string());
+    if cfg.exec_init_groups {
+        // Attach as container root, then drop to the exec user with its groups (e.g. docker).
+        args.extend([
+            "setpriv".to_string(),
+            format!("--reuid={}", cfg.exec_uid),
+            format!("--regid={}", cfg.exec_gid),
+            "--init-groups".to_string(),
+        ]);
+    }
     // lxc-attach has no working-directory option, so change into the workspace first.
     args.extend([
-        "--".to_string(),
         "/bin/sh".to_string(),
         "-c".to_string(),
         format!("cd {WORKSPACE_MOUNT} 2>/dev/null || cd /; exec \"$@\""),
@@ -610,8 +620,8 @@ impl ProxmoxManager {
             ("onboot", "0".to_string()),
             ("start", "0".to_string()),
         ];
-        if pcfg.nesting {
-            params.push(("features", "nesting=1".to_string()));
+        if let Some(features) = pcfg.features() {
+            params.push(("features", features));
         }
         if let Some(cpu) = security.cpu_limit {
             params.push(("cores", (cpu.ceil().max(1.0) as u64).to_string()));
@@ -1023,21 +1033,29 @@ mod tests {
     #[test]
     fn attach_args_run_as_exec_user_in_workspace() {
         let cfg = ProxmoxConfig::default();
-        let args = lxc_attach_args(
-            &cfg,
-            "105",
-            &["A=1".to_string()],
-            &["/bin/bash".to_string(), "-l".to_string()],
-        );
+        let cmd = ["/bin/bash".to_string(), "-l".to_string()];
+        let args = lxc_attach_args(&cfg, "105", &["A=1".to_string()], &cmd);
         assert_eq!(
             args,
             vec![
-                "-n", "105", "--clear-env", "--uid", "1000", "--gid", "1000", "--set-var", "A=1",
-                "--", "/bin/sh", "-c",
+                "-n", "105", "--clear-env", "--set-var", "A=1", "--",
+                "setpriv", "--reuid=1000", "--regid=1000", "--init-groups",
+                "/bin/sh", "-c",
                 "cd /workspace 2>/dev/null || cd /; exec \"$@\"",
                 "agentman", "/bin/bash", "-l",
             ]
         );
+
+        let no_groups = ProxmoxConfig {
+            exec_init_groups: false,
+            ..ProxmoxConfig::default()
+        };
+        let args = lxc_attach_args(&no_groups, "105", &[], &cmd);
+        assert_eq!(
+            &args[..8],
+            ["-n", "105", "--clear-env", "--uid", "1000", "--gid", "1000", "--"]
+        );
+        assert_eq!(args[8], "/bin/sh");
     }
 
     #[test]
@@ -1051,6 +1069,19 @@ mod tests {
         assert!(ct.is_managed());
         assert_eq!(ct.cpus, Some(4.0));
         assert_eq!(ct.maxmem, Some(4194304));
+    }
+
+    #[test]
+    fn features_allow_docker_inside() {
+        assert_eq!(
+            ProxmoxConfig::default().features().as_deref(),
+            Some("nesting=1,keyctl=1")
+        );
+        let privileged = ProxmoxConfig {
+            unprivileged: false,
+            ..ProxmoxConfig::default()
+        };
+        assert_eq!(privileged.features().as_deref(), Some("nesting=1"));
     }
 
     #[test]
