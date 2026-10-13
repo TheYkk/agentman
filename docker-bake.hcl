@@ -24,6 +24,8 @@ variable "CLAUDE_CLI_VERSION"  { default = "2.1.296" }
 variable "PI_VERSION"       { default = "1.2.0" }
 variable "OMP_VERSION"      { default = "18.10.3" }
 variable "CLOUDFLARED_VERSION" { default = "2026.10.0" }
+variable "GH_VERSION"       { default = "2.102.0" }
+variable "CADDY_VERSION"    { default = "2.11.7" }
 
 variable "USERNAME"      { default = "agent" }
 variable "USER_UID"      { default = "1000" }
@@ -64,6 +66,8 @@ target "agentman" {
     PI_VERSION       = "${PI_VERSION}"
     OMP_VERSION      = "${OMP_VERSION}"
     CLOUDFLARED_VERSION = "${CLOUDFLARED_VERSION}"
+    GH_VERSION       = "${GH_VERSION}"
+    CADDY_VERSION    = "${CADDY_VERSION}"
 
     USERNAME         = "${USERNAME}"
     USER_UID         = "${USER_UID}"

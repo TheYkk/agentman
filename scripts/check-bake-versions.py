@@ -477,6 +477,8 @@ def _checks_for(bake_vars: dict[str, str]) -> list[Check]:
     checks.append(_check_npm_version(name="PI_VERSION", current=cur("PI_VERSION"), package="@earendil-works/pi-coding-agent"))
     checks.append(_check_npm_version(name="OMP_VERSION", current=cur("OMP_VERSION"), package="@oh-my-pi/pi-coding-agent"))
     checks.append(_check_github_version(name="CLOUDFLARED_VERSION", current=cur("CLOUDFLARED_VERSION"), owner="cloudflare", repo="cloudflared"))
+    checks.append(_check_github_version(name="GH_VERSION", current=cur("GH_VERSION"), owner="cli", repo="cli", strip=("v",)))
+    checks.append(_check_github_version(name="CADDY_VERSION", current=cur("CADDY_VERSION"), owner="caddyserver", repo="caddy", strip=("v",)))
     checks.append(_check_github_version(name="HERDR_VERSION", current=cur("HERDR_VERSION"), owner="herdrdev", repo="herdr"))
 
     return checks

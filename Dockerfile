@@ -24,6 +24,8 @@ ARG CLAUDE_CLI_VERSION=2.1.296
 ARG PI_VERSION=1.2.0
 ARG OMP_VERSION=18.10.3
 ARG CLOUDFLARED_VERSION=2026.10.0
+ARG GH_VERSION=2.102.0
+ARG CADDY_VERSION=2.11.7
 
 # User config
 ARG USERNAME=agent
@@ -76,6 +78,8 @@ RUN apt-get update \
       psmisc \
       procps \
       ripgrep \
+      bat \
+      eza \
       tmux \
       fd-find \
       rsync \
@@ -128,6 +132,32 @@ RUN arch="$(dpkg --print-architecture)" \
  && rm -f /tmp/cloudflared \
  && cloudflared --version
 
+# --- GitHub CLI (pinned) ---
+RUN arch="$(dpkg --print-architecture)" \
+ && case "${arch}" in \
+      amd64|arm64) gh_arch="${arch}" ;; \
+      *) echo "Unsupported dpkg architecture: ${arch}" >&2; exit 1 ;; \
+    esac \
+ && tmpdir="$(mktemp -d)" \
+ && curl -fsSL -o "${tmpdir}/gh.tar.gz" "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${gh_arch}.tar.gz" \
+ && tar -C "${tmpdir}" -xzf "${tmpdir}/gh.tar.gz" \
+ && install -m 0755 "${tmpdir}/gh_${GH_VERSION}_linux_${gh_arch}/bin/gh" /usr/local/bin/gh \
+ && rm -rf "${tmpdir}" \
+ && gh --version
+
+# --- Caddy (pinned) ---
+RUN arch="$(dpkg --print-architecture)" \
+ && case "${arch}" in \
+      amd64|arm64) caddy_arch="${arch}" ;; \
+      *) echo "Unsupported dpkg architecture: ${arch}" >&2; exit 1 ;; \
+    esac \
+ && tmpdir="$(mktemp -d)" \
+ && curl -fsSL -o "${tmpdir}/caddy.tar.gz" "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_${caddy_arch}.tar.gz" \
+ && tar -C "${tmpdir}" -xzf "${tmpdir}/caddy.tar.gz" caddy \
+ && install -m 0755 "${tmpdir}/caddy" /usr/local/bin/caddy \
+ && rm -rf "${tmpdir}" \
+ && caddy version
+
 # --- DuckDB CLI (pinned) ---
 RUN arch="$(dpkg --print-architecture)" \
  && case "${arch}" in \
@@ -144,8 +174,11 @@ RUN arch="$(dpkg --print-architecture)" \
 
 SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 
-# Convenience: Debian provides `fdfind`, but most people expect `fd`.
-RUN if command -v fdfind >/dev/null 2>&1 && ! command -v fd >/dev/null 2>&1; then ln -s "$(command -v fdfind)" /usr/local/bin/fd; fi
+# Convenience: Debian provides `fdfind` and `batcat`, but most people expect `fd` and `bat`.
+RUN if command -v fdfind >/dev/null 2>&1 && ! command -v fd >/dev/null 2>&1; then ln -s "$(command -v fdfind)" /usr/local/bin/fd; fi \
+ && if command -v batcat >/dev/null 2>&1 && ! command -v bat >/dev/null 2>&1; then ln -s "$(command -v batcat)" /usr/local/bin/bat; fi \
+ && bat --version \
+ && eza --version
 
 # --- Go (pinned) ---
 RUN arch="$(dpkg --print-architecture)" \

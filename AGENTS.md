@@ -72,13 +72,13 @@ Derived from `Dockerfile` + `docker-bake.hcl`:
   - **DuckDB CLI** (`1.4.3`)
   - **opencode** v2 (default agent, opened in a herdr workspace on start)
   - **Claude Code** (`claude`), **pi** (`pi`), **omp** (`omp`, oh-my-pi)
-  - **cloudflared** (Cloudflare Tunnel client)
+  - **cloudflared** (Cloudflare Tunnel client), **Caddy** (`caddy`), **GitHub CLI** (`gh`)
   - **herdr** (`v0.9.4`) (default `CMD` is `herdr server` under `tini`; attach with `herdr`)
 - **Database CLIs**:
   - `duckdb`, `psql` (postgresql-client), `mysql` (default-mysql-client), `sqlite3`
 - **Build tooling**:
   - `build-essential`, `make`, `cmake`, `pkg-config`, `libssl-dev`
 - **Common utilities**:
-  - `git`, `curl`, `wget`, `jq`, `ripgrep` (`rg`), `fd`, `rsync`, `tree`, `zip`/`unzip`, `openssh-client`, `sudo`
+  - `git`, `curl`, `wget`, `jq`, `ripgrep` (`rg`), `fd`, `bat`, `eza`, `rsync`, `tree`, `zip`/`unzip`, `openssh-client`, `sudo`
 - **Container tooling**:
   - `docker` (via `docker.io`)

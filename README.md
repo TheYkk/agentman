@@ -12,7 +12,8 @@ Debian-based base image for a coding agent with pinned versions of:
 - **DuckDB** (CLI)
 - **opencode** v2 (default agent: opened in a herdr workspace in `/workspace` on start)
 - **Claude Code**, **pi** and **omp** (oh-my-pi) coding agents, with herdr integrations installed for all four
-- **cloudflared** (Cloudflare Tunnel client)
+- **cloudflared** (Cloudflare Tunnel client), **Caddy** and the GitHub CLI (`gh`)
+- CLI basics: `docker`, `git`, `jq`, `rg`, `fd`, `bat`, `eza`, `sqlite3`
 
 Python is installed using uv per the official guide: `https://docs.astral.sh/uv/guides/install-python/`.
 
@@ -311,7 +312,7 @@ Note: `agentman exec <cmd>` is accepted as an alias (e.g. `agentman exec stats -
 
 Edit `docker-bake.hcl` (the `variable` defaults near the top), or override via environment variables:
 - **Base image**: `DEBIAN_TAG`
-- **Tools**: `HERDR_VERSION`, `RUSTUP_VERSION`, `RUST_TOOLCHAIN`, `GO_VERSION`, `BUN_VERSION`, `NODE_VERSION`, `UV_VERSION`, `PYTHON_VERSION`, `SDKMAN_VERSION`, `JAVA_VERSION`, `DUCKDB_VERSION`, `OPENCODE_VERSION`, `CLAUDE_CLI_VERSION`, `PI_VERSION`, `OMP_VERSION`, `CLOUDFLARED_VERSION`
+- **Tools**: `HERDR_VERSION`, `RUSTUP_VERSION`, `RUST_TOOLCHAIN`, `GO_VERSION`, `BUN_VERSION`, `NODE_VERSION`, `UV_VERSION`, `PYTHON_VERSION`, `SDKMAN_VERSION`, `JAVA_VERSION`, `DUCKDB_VERSION`, `OPENCODE_VERSION`, `CLAUDE_CLI_VERSION`, `PI_VERSION`, `OMP_VERSION`, `CLOUDFLARED_VERSION`, `GH_VERSION`, `CADDY_VERSION`
 - **User**: `USERNAME`, `USER_UID`, `USER_GID`
 
 ### Build (local)
