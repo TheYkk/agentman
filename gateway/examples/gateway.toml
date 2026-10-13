@@ -117,16 +117,17 @@ exec_uid = 1000
 exec_gid = 1000
 # Keep the user's supplementary groups (e.g. docker) via setpriv inside the container
 exec_init_groups = true
-# lxc-attach starts from a clean environment; these mirror the base image's ENV
+# lxc-attach starts from a clean environment; these mirror the base image's ENV (incl. mise shims)
 exec_env = [
     "HOME=/home/agent",
+    "SHELL=/bin/bash",
     "USER=agent",
     "LOGNAME=agent",
     "LANG=C.UTF-8",
     "BUN_INSTALL=/usr/local/bun",
     "GOPATH=/home/agent/go",
     "JAVA_HOME=/home/agent/.sdkman/candidates/java/current",
-    "PATH=/home/agent/.cargo/bin:/home/agent/.local/bin:/home/agent/go/bin:/usr/local/go/bin:/usr/local/bun/bin:/usr/local/node/bin:/home/agent/.sdkman/candidates/java/current/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "PATH=/home/agent/.cargo/bin:/home/agent/.local/bin:/home/agent/.local/share/mise/shims:/home/agent/go/bin:/usr/local/go/bin:/usr/local/bun/bin:/usr/local/node/bin:/home/agent/.sdkman/candidates/java/current/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 ]
 
 lxc_bin_dir = "/usr/bin"
