@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{DockerInSandboxMode, GatewayConfig, ProxmoxConfig, RuntimeKind};
 use crate::docker::{ensure_workspace_writable, parse_memory_limit};
-use crate::inner_docker::start_dockerd_command;
+use crate::inner_docker::{start_dockerd_command, DOCKERD_READY_TIMEOUT_SECS};
 use crate::pty::{make_controlling_terminal, open_pty, PtyReader, PtyWriter};
 use crate::runtime::{
     KeyedLocks, DestroyOptions, DestroyResult, ExecOutput, ExecProcess, ExecSpec, Resizer, SandboxStats,
@@ -885,10 +885,11 @@ impl ProxmoxManager {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .output();
-        match tokio::time::timeout(Duration::from_secs(30), run).await {
+        let limit = Duration::from_secs(u64::from(DOCKERD_READY_TIMEOUT_SECS) + 15);
+        match tokio::time::timeout(limit, run).await {
             Ok(Ok(out)) if out.status.success() => {}
             Ok(Ok(out)) => warn!(
-                "Failed to start dockerd in container {}: {}",
+                "dockerd in container {} is not ready: {}",
                 vmid,
                 String::from_utf8_lossy(&out.stderr).trim()
             ),

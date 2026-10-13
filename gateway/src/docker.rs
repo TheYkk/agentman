@@ -511,25 +511,43 @@ impl ContainerManager {
         let options = CreateExecOptions {
             cmd: Some(inner_docker::start_dockerd_command(self.config.workspace_owner().1)),
             user: Some("root".to_string()),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
             ..Default::default()
         };
-        let result = async {
+        // The command returns once dockerd answers, so wait for it: the session's first
+        // `docker` command then finds a ready daemon.
+        let run = async {
             let exec = self.docker.create_exec(container_id, options).await?;
-            self.docker
-                .start_exec(
-                    &exec.id,
-                    Some(StartExecOptions {
-                        detach: true,
-                        tty: false,
-                        output_capacity: None,
-                    }),
-                )
-                .await?;
-            Ok::<_, bollard::errors::Error>(())
-        }
-        .await;
-        if let Err(e) = result {
-            warn!("Failed to start dockerd in container {}: {}", container_id, e);
+            let mut stderr = Vec::new();
+            if let StartExecResults::Attached { mut output, .. } =
+                self.docker.start_exec(&exec.id, None::<StartExecOptions>).await?
+            {
+                while let Some(chunk) = output.next().await {
+                    if let LogOutput::StdErr { message } = chunk? {
+                        stderr.extend_from_slice(&message);
+                    }
+                }
+            }
+            let code = self
+                .docker
+                .inspect_exec(&exec.id)
+                .await?
+                .exit_code
+                .unwrap_or(0);
+            Ok::<_, bollard::errors::Error>((code, stderr))
+        };
+        let limit = Duration::from_secs(u64::from(inner_docker::DOCKERD_READY_TIMEOUT_SECS) + 15);
+        match timeout(limit, run).await {
+            Ok(Ok((0, _))) => {}
+            Ok(Ok((code, stderr))) => warn!(
+                "dockerd in container {} is not ready (exit {}): {}",
+                container_id,
+                code,
+                String::from_utf8_lossy(&stderr).trim()
+            ),
+            Ok(Err(e)) => warn!("Failed to start dockerd in container {}: {}", container_id, e),
+            Err(_) => warn!("Timed out starting dockerd in container {}", container_id),
         }
     }
 

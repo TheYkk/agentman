@@ -96,8 +96,10 @@ RUN apt-get update \\
 COPY image.env /etc/agentman/image.env
 COPY agentman.service /etc/systemd/system/agentman.service
 COPY interfaces /etc/network/interfaces
+# The gateway starts dockerd itself (as root via lxc-attach, with the socket group it needs);
+# docker.io's own units would race it and leave the socket unusable.
 RUN systemctl enable agentman.service networking.service \\
- && systemctl mask systemd-networkd-wait-online.service \\
+ && systemctl mask systemd-networkd-wait-online.service docker.service docker.socket \\
  && : > /etc/machine-id
 EOF
 

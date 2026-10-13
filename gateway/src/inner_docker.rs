@@ -9,20 +9,37 @@
 /// Where dockerd's output goes inside the sandbox.
 pub const DOCKERD_LOG: &str = "/var/log/dockerd.log";
 
-/// Command that starts dockerd inside the sandbox unless it is already running. Run it as root,
-/// detached; it returns as soon as dockerd has been launched.
+/// How long [`start_dockerd_command`] waits for the daemon to answer, in seconds.
+pub const DOCKERD_READY_TIMEOUT_SECS: u32 = 20;
+
+/// Command that starts dockerd inside the sandbox unless it is already running, then waits (up
+/// to [`DOCKERD_READY_TIMEOUT_SECS`]) until it answers on its socket, so the session's first
+/// `docker` command does not race daemon startup. Run it as root and wait for it to exit; dockerd
+/// keeps running in the background. Exits 1 if the daemon never became ready.
 ///
 /// The socket is owned by `socket_gid` (the sandbox user's group) so `docker` works without sudo.
 /// A restarted sandbox keeps its old pid file, which dockerd refuses to start over, so it is
 /// removed first.
 pub fn start_dockerd_command(socket_gid: u32) -> Vec<String> {
+    let tries = DOCKERD_READY_TIMEOUT_SECS * 4;
     vec![
         "sh".to_string(),
         "-c".to_string(),
         format!(
-            "pgrep -x dockerd >/dev/null 2>&1 && exit 0; \
-             rm -f /var/run/docker.pid; \
-             nohup dockerd --group {socket_gid} >{DOCKERD_LOG} 2>&1 &"
+            "if ! pgrep -x dockerd >/dev/null 2>&1; then \
+               rm -f /var/run/docker.pid; \
+               nohup dockerd --group {socket_gid} >{DOCKERD_LOG} 2>&1 </dev/null & \
+             fi; \
+             i=0; \
+             while [ $i -lt {tries} ]; do \
+               if command -v docker >/dev/null 2>&1; then \
+                 docker version >/dev/null 2>&1 && exit 0; \
+               elif [ -S /var/run/docker.sock ]; then \
+                 exit 0; \
+               fi; \
+               sleep 0.25; i=$((i+1)); \
+             done; \
+             echo \"dockerd did not become ready; see {DOCKERD_LOG}\" >&2; exit 1"
         ),
     ]
 }
@@ -35,7 +52,8 @@ mod tests {
     fn start_command_is_idempotent_and_sets_socket_group() {
         let cmd = start_dockerd_command(1000);
         assert_eq!(&cmd[..2], ["sh", "-c"]);
-        assert!(cmd[2].starts_with("pgrep -x dockerd >/dev/null 2>&1 && exit 0;"));
+        assert!(cmd[2].starts_with("if ! pgrep -x dockerd >/dev/null 2>&1; then"));
         assert!(cmd[2].contains("dockerd --group 1000 >/var/log/dockerd.log"));
+        assert!(cmd[2].contains("docker version"));
     }
 }
