@@ -165,6 +165,11 @@ pub struct ProxmoxConfig {
     /// On Proxmox VE 9.1+ this can also be an OCI image archive.
     pub ostemplate: String,
 
+    /// Optional `ostype` for the container. Leave unset to let Proxmox detect it from the
+    /// template; `unmanaged` stops Proxmox from writing network/hostname config inside
+    /// (useful when the template's distro is newer than the node supports).
+    pub ostype: Option<String>,
+
     /// Storage for the container root filesystem.
     pub storage: String,
 
@@ -236,6 +241,7 @@ impl Default for ProxmoxConfig {
             ca_cert: Some(PathBuf::from("/etc/pve/pve-root-ca.pem")),
             insecure_skip_tls_verify: false,
             ostemplate: "local:vztmpl/agentman-base.tar".to_string(),
+            ostype: None,
             storage: "local-lvm".to_string(),
             rootfs_size_gb: 16,
             default_memory_mb: 4096,

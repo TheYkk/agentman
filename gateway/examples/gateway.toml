@@ -94,6 +94,7 @@ insecure_skip_tls_verify = false
 
 # Container template (on PVE 9.1+ this can be an OCI image pulled into vztmpl storage)
 ostemplate = "local:vztmpl/agentman-base_latest.tar"
+# ostype = "unmanaged"   # if Proxmox does not recognize the template's distro version
 storage = "local-lvm"
 rootfs_size_gb = 16
 # Used when container_security.memory_limit is not set

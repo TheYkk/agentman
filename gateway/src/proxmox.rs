@@ -666,6 +666,9 @@ impl ProxmoxManager {
             params.push(("cores", (cpu.ceil().max(1.0) as u64).to_string()));
             params.push(("cpulimit", format!("{cpu}")));
         }
+        if let Some(ref ostype) = pcfg.ostype {
+            params.push(("ostype", ostype.clone()));
+        }
         if let Some(ref pool) = pcfg.pool {
             params.push(("pool", pool.clone()));
         }

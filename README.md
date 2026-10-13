@@ -230,7 +230,15 @@ How it works:
 
 Setup:
 
-1. **Template.** On Proxmox VE 9.1+, pull the base image as an OCI template (Datacenter → Storage → CT Templates → *Pull from OCI Registry*, e.g. `ghcr.io/theykk/agentman-base:latest`) and set `ostemplate` to the resulting volume (for example `local:vztmpl/agentman-base_latest.tar`). Any LXC template works as long as it has a user with UID 1000 and the tools you need (`bash`, `tmux`, `socat` for `ssh -L`).
+1. **Template.**
+   - *Proxmox VE 8.x (and 9.x):* build a regular container template from the image. It adds systemd as init, a DHCP client, and an `agentman.service` that runs the image's entrypoint:
+     ```bash
+     scripts/build-lxc-template.sh ghcr.io/theykk/agentman-base:latest agentman-base.tar.zst   # needs docker, jq, zstd
+     scp agentman-base.tar.zst root@pve:/var/lib/vz/template/cache/
+     ```
+     and set `ostemplate = "local:vztmpl/agentman-base.tar.zst"`. If the node rejects the template's Debian version, set `ostype = "unmanaged"`; the template then configures `eth0` with DHCP itself.
+   - *Proxmox VE 9.1+:* you can instead pull the image as an OCI template (Datacenter → Storage → CT Templates → *Pull from OCI Registry*, e.g. `ghcr.io/theykk/agentman-base:latest`) and set `ostemplate` to the resulting volume. A plain `docker export` without an init does not boot on any version.
+   - Any other LXC template works as long as it has a user with UID 1000 and the tools you need (`bash`, `tmux`, `socat` for `ssh -L`, `setpriv`, and `dockerd` for Docker inside).
 2. **API token.** Create a user and token with enough rights to manage containers:
    ```bash
    pveum user add agentman@pve
