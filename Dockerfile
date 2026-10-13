@@ -1,24 +1,28 @@
+# syntax=docker/dockerfile:1
 ARG DEBIAN_TAG=trixie-slim
 FROM debian:${DEBIAN_TAG}
 
 # Keep this Dockerfile deterministic and CI-friendly:
 # - All non-apt tools are installed with explicit, configurable versions.
 # - Versions are set via build args (see `docker-bake.hcl`).
+# - Most tools are installed with mise (https://mise.jdx.dev), which resolves versions via
+#   https://mise-versions.jdx.dev; Rust (rustup), Python (uv) and Java (SDKMAN) keep their own installers.
 
 ARG DEBIAN_TAG
 
 # Tool versions (override at build time)
-ARG HERDR_VERSION=v0.9.4
+ARG MISE_VERSION=2026.10.9
+ARG HERDR_VERSION=0.9.4
 ARG RUSTUP_VERSION=1.27.1
 ARG RUST_TOOLCHAIN=1.92.0
-ARG GO_VERSION=1.25.5
+ARG GO_VERSION=1.27.2
 ARG BUN_VERSION=1.4.3
-ARG NODE_VERSION=22.13.1
-ARG UV_VERSION=0.9.22
+ARG NODE_VERSION=22.23.3
+ARG UV_VERSION=0.13.0
 ARG PYTHON_VERSION=3.13
 ARG SDKMAN_VERSION=5.20.0
 ARG JAVA_VERSION=21.0.9-tem
-ARG DUCKDB_VERSION=1.4.3
+ARG DUCKDB_VERSION=1.5.6
 ARG OPENCODE_VERSION=2.0.28
 ARG CLAUDE_CLI_VERSION=2.1.296
 ARG PI_VERSION=1.2.0
@@ -26,6 +30,8 @@ ARG OMP_VERSION=18.10.3
 ARG CLOUDFLARED_VERSION=2026.10.0
 ARG GH_VERSION=2.102.0
 ARG CADDY_VERSION=2.11.7
+ARG EZA_VERSION=0.23.5
+ARG BAT_VERSION=0.26.1
 
 # User config
 ARG USERNAME=agent
@@ -78,8 +84,6 @@ RUN apt-get update \
       psmisc \
       procps \
       ripgrep \
-      bat \
-      eza \
       tmux \
       fd-find \
       rsync \
@@ -106,163 +110,24 @@ RUN apt-get update \
     fi \
  && rm -rf /var/lib/apt/lists/*
 
-# --- herdr (pinned) ---
-# Terminal workspace manager for coding agents; runs as the container's main process (see CMD).
-# https://github.com/herdrdev/herdr
-RUN arch="$(dpkg --print-architecture)" \
- && case "${arch}" in \
-      amd64) herdr_arch="x86_64" ;; \
-      arm64) herdr_arch="aarch64" ;; \
-      *) echo "Unsupported dpkg architecture: ${arch}" >&2; exit 1 ;; \
-    esac \
- && curl -fsSL -o /tmp/herdr "https://github.com/herdrdev/herdr/releases/download/${HERDR_VERSION}/herdr-linux-${herdr_arch}" \
- && install -m 0755 /tmp/herdr /usr/local/bin/herdr \
- && rm -f /tmp/herdr \
- && herdr --version
-
-# --- cloudflared (pinned) ---
-# Cloudflare Tunnel client, for exposing services in the container without opening ports.
-RUN arch="$(dpkg --print-architecture)" \
- && case "${arch}" in \
-      amd64|arm64) cf_arch="${arch}" ;; \
-      *) echo "Unsupported dpkg architecture: ${arch}" >&2; exit 1 ;; \
-    esac \
- && curl -fsSL -o /tmp/cloudflared "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${cf_arch}" \
- && install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared \
- && rm -f /tmp/cloudflared \
- && cloudflared --version
-
-# --- GitHub CLI (pinned) ---
-RUN arch="$(dpkg --print-architecture)" \
- && case "${arch}" in \
-      amd64|arm64) gh_arch="${arch}" ;; \
-      *) echo "Unsupported dpkg architecture: ${arch}" >&2; exit 1 ;; \
-    esac \
- && tmpdir="$(mktemp -d)" \
- && curl -fsSL -o "${tmpdir}/gh.tar.gz" "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${gh_arch}.tar.gz" \
- && tar -C "${tmpdir}" -xzf "${tmpdir}/gh.tar.gz" \
- && install -m 0755 "${tmpdir}/gh_${GH_VERSION}_linux_${gh_arch}/bin/gh" /usr/local/bin/gh \
- && rm -rf "${tmpdir}" \
- && gh --version
-
-# --- Caddy (pinned) ---
-RUN arch="$(dpkg --print-architecture)" \
- && case "${arch}" in \
-      amd64|arm64) caddy_arch="${arch}" ;; \
-      *) echo "Unsupported dpkg architecture: ${arch}" >&2; exit 1 ;; \
-    esac \
- && tmpdir="$(mktemp -d)" \
- && curl -fsSL -o "${tmpdir}/caddy.tar.gz" "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_${caddy_arch}.tar.gz" \
- && tar -C "${tmpdir}" -xzf "${tmpdir}/caddy.tar.gz" caddy \
- && install -m 0755 "${tmpdir}/caddy" /usr/local/bin/caddy \
- && rm -rf "${tmpdir}" \
- && caddy version
-
-# --- DuckDB CLI (pinned) ---
-RUN arch="$(dpkg --print-architecture)" \
- && case "${arch}" in \
-      amd64) duck_arch="amd64" ;; \
-      arm64) duck_arch="arm64" ;; \
-      *) echo "Unsupported dpkg architecture: ${arch}" >&2; exit 1 ;; \
-    esac \
- && curl -fsSL -o /tmp/duckdb.zip "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-linux-${duck_arch}.zip" \
- && mkdir -p /tmp/duckdb \
- && unzip -q /tmp/duckdb.zip -d /tmp/duckdb \
- && install -m 0755 /tmp/duckdb/duckdb /usr/local/bin/duckdb \
- && rm -rf /tmp/duckdb /tmp/duckdb.zip \
- && duckdb --version
-
 SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 
-# Convenience: Debian provides `fdfind` and `batcat`, but most people expect `fd` and `bat`.
-RUN if command -v fdfind >/dev/null 2>&1 && ! command -v fd >/dev/null 2>&1; then ln -s "$(command -v fdfind)" /usr/local/bin/fd; fi \
- && if command -v batcat >/dev/null 2>&1 && ! command -v bat >/dev/null 2>&1; then ln -s "$(command -v batcat)" /usr/local/bin/bat; fi \
- && bat --version \
- && eza --version
+# Convenience: Debian provides `fdfind`, but most people expect `fd`.
+RUN if command -v fdfind >/dev/null 2>&1 && ! command -v fd >/dev/null 2>&1; then ln -s "$(command -v fdfind)" /usr/local/bin/fd; fi
 
-# --- Go (pinned) ---
+# --- mise (pinned) ---
 RUN arch="$(dpkg --print-architecture)" \
  && case "${arch}" in \
-      amd64) go_arch="amd64" ;; \
-      arm64) go_arch="arm64" ;; \
+      amd64) mise_arch="x64" ;; \
+      arm64) mise_arch="arm64" ;; \
       *) echo "Unsupported dpkg architecture: ${arch}" >&2; exit 1 ;; \
     esac \
- && curl -fsSL -o /tmp/go.tgz "https://go.dev/dl/go${GO_VERSION}.linux-${go_arch}.tar.gz" \
- && rm -rf /usr/local/go \
- && tar -C /usr/local -xzf /tmp/go.tgz \
- && rm -f /tmp/go.tgz \
- && ln -sf /usr/local/go/bin/go /usr/local/bin/go \
- && ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt \
- && go version
+ && curl -fsSL -o /tmp/mise "https://github.com/jdx/mise/releases/download/v${MISE_VERSION}/mise-v${MISE_VERSION}-linux-${mise_arch}" \
+ && install -m 0755 /tmp/mise /usr/local/bin/mise \
+ && rm -f /tmp/mise \
+ && mise --version
 
-# --- Node.js (pinned) ---
-RUN arch="$(dpkg --print-architecture)" \
- && case "${arch}" in \
-      amd64) node_arch="x64" ;; \
-      arm64) node_arch="arm64" ;; \
-      *) echo "Unsupported dpkg architecture: ${arch}" >&2; exit 1 ;; \
-    esac \
- && curl -fsSL -o /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${node_arch}.tar.xz" \
- && rm -rf /usr/local/node \
- && mkdir -p /usr/local/node \
- && tar -C /usr/local/node --strip-components=1 -xJf /tmp/node.tar.xz \
- && ln -sf /usr/local/node/bin/node /usr/local/bin/node \
- && ln -sf /usr/local/node/bin/npm /usr/local/bin/npm \
- && ln -sf /usr/local/node/bin/npx /usr/local/bin/npx \
- && rm -f /tmp/node.tar.xz \
- && node --version \
- && npm --version
-
-# --- Bun (pinned) ---
-ENV BUN_INSTALL=/usr/local/bun
-RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}" \
- && ln -sf /usr/local/bun/bin/bun /usr/local/bin/bun \
- && bun --version
-
-# --- uv (pinned) ---
-# We download the exact release artifact for the platform and install `uv` + `uvx` to /usr/local/bin.
-RUN arch="$(dpkg --print-architecture)" \
- && case "${arch}" in \
-      amd64) uv_triple="x86_64-unknown-linux-gnu" ;; \
-      arm64) uv_triple="aarch64-unknown-linux-gnu" ;; \
-      *) echo "Unsupported dpkg architecture: ${arch}" >&2; exit 1 ;; \
-    esac \
- && uv_archive="uv-${uv_triple}.tar.gz" \
- && curl -fsSL -o /tmp/uv.tar.gz "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${uv_archive}" \
- && tar -C /tmp -xzf /tmp/uv.tar.gz \
- && install -m 0755 "/tmp/uv-${uv_triple}/uv" /usr/local/bin/uv \
- && install -m 0755 "/tmp/uv-${uv_triple}/uvx" /usr/local/bin/uvx \
- && rm -rf /tmp/uv.tar.gz "/tmp/uv-${uv_triple}" \
- && uv --version
-
-# --- opencode v2 (pinned) ---
-# OpenCode 2 ships per-platform CLI binaries as npm tarballs (the same source as https://opencode.ai/v2/install).
-RUN arch="$(dpkg --print-architecture)" \
- && case "${arch}" in \
-      amd64) oc_arch="x64" ;; \
-      arm64) oc_arch="arm64" ;; \
-      *) echo "Unsupported dpkg architecture: ${arch}" >&2; exit 1 ;; \
-    esac \
- && tmpdir="$(mktemp -d)" \
- && curl -fsSL -o "${tmpdir}/opencode.tgz" "https://registry.npmjs.org/@opencode/cli-linux-${oc_arch}/-/cli-linux-${oc_arch}-${OPENCODE_VERSION}.tgz" \
- && tar -C "${tmpdir}" -xzf "${tmpdir}/opencode.tgz" \
- && install -m 0755 "${tmpdir}/package/bin/opencode" /usr/local/bin/opencode \
- && rm -rf "${tmpdir}" \
- && opencode --version
-
-# --- Claude Code, pi, omp (pinned, global npm packages) ---
-# omp runs on Bun; Claude Code and pi run on Node.js. Installed root-owned, so self-updates are disabled below.
-RUN npm install -g --no-fund --no-audit \
-      "@anthropic-ai/claude-code@${CLAUDE_CLI_VERSION}" \
-      "@earendil-works/pi-coding-agent@${PI_VERSION}" \
-      "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
- && npm cache clean --force \
- && ln -sf /usr/local/node/bin/claude /usr/local/bin/claude \
- && ln -sf /usr/local/node/bin/pi /usr/local/bin/pi \
- && ln -sf /usr/local/node/bin/omp /usr/local/bin/omp \
- && claude --version \
- && pi --version \
- && omp --version
+# Agents are pinned by mise, so turn off Claude Code's self-updater.
 ENV DISABLE_AUTOUPDATER=1
 
 # --- SSH Server Setup (as root) ---
@@ -291,7 +156,49 @@ ENV HOME=/home/${USERNAME} \
     GOPATH=/home/${USERNAME}/go \
     SDKMAN_DIR=/home/${USERNAME}/.sdkman \
     JAVA_HOME=/home/${USERNAME}/.sdkman/candidates/java/current \
-    PATH=/home/${USERNAME}/.cargo/bin:/home/${USERNAME}/.local/bin:/home/${USERNAME}/go/bin:/usr/local/go/bin:/usr/local/bun/bin:/usr/local/node/bin:/home/${USERNAME}/.sdkman/candidates/java/current/bin:${PATH}
+    MISE_YES=1 \
+    PATH=/home/${USERNAME}/.cargo/bin:/home/${USERNAME}/.local/bin:/home/${USERNAME}/.local/share/mise/shims:/home/${USERNAME}/go/bin:/home/${USERNAME}/.sdkman/candidates/java/current/bin:${PATH}
+
+# --- Tools via mise (pinned) ---
+# Installed into the agent's global mise config (~/.config/mise/config.toml), exposed through mise shims.
+# An optional `github_token` build secret raises GitHub API rate limits for release downloads.
+RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN \
+    mise use -g \
+      "herdr@${HERDR_VERSION}" \
+      "cloudflared@${CLOUDFLARED_VERSION}" \
+      "gh@${GH_VERSION}" \
+      "caddy@${CADDY_VERSION}" \
+      "duckdb@${DUCKDB_VERSION}" \
+      "eza@${EZA_VERSION}" \
+      "bat@${BAT_VERSION}" \
+      "go@${GO_VERSION}" \
+      "node@${NODE_VERSION}" \
+      "bun@${BUN_VERSION}" \
+      "uv@${UV_VERSION}" \
+ && herdr --version \
+ && cloudflared --version \
+ && gh --version \
+ && caddy version \
+ && duckdb --version \
+ && eza --version \
+ && bat --version \
+ && go version \
+ && node --version \
+ && npm --version \
+ && bun --version \
+ && uv --version
+
+# Coding agents (npm packages need Node.js from the step above; omp runs on Bun).
+RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN \
+    mise use -g \
+      "npm:@opencode/cli@${OPENCODE_VERSION}" \
+      "npm:@anthropic-ai/claude-code@${CLAUDE_CLI_VERSION}" \
+      "npm:@earendil-works/pi-coding-agent@${PI_VERSION}" \
+      "npm:@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
+ && opencode --version \
+ && claude --version \
+ && pi --version \
+ && omp --version
 
 # --- Rust via rustup (pinned rustup-init + pinned toolchain) ---
 RUN arch="$(dpkg --print-architecture)" \

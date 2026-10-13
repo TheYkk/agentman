@@ -1,6 +1,6 @@
 ## agentman
 
-Debian-based base image for a coding agent with pinned versions of:
+Debian-based base image for a coding agent with pinned versions of the tools below. Most are installed with [mise](https://mise.jdx.dev) (versions resolved via `https://mise-versions.jdx.dev`); Rust uses rustup, Python uses uv, and Java uses SDKMAN.
 - **herdr** (terminal workspace manager for coding agents; its headless server is the default command under `tini`)
 - **Rust** (via `rustup`) + pinned toolchain
 - **rust-analyzer** (via `rustup component add`, pinned to toolchain)
@@ -312,7 +312,7 @@ Note: `agentman exec <cmd>` is accepted as an alias (e.g. `agentman exec stats -
 
 Edit `docker-bake.hcl` (the `variable` defaults near the top), or override via environment variables:
 - **Base image**: `DEBIAN_TAG`
-- **Tools**: `HERDR_VERSION`, `RUSTUP_VERSION`, `RUST_TOOLCHAIN`, `GO_VERSION`, `BUN_VERSION`, `NODE_VERSION`, `UV_VERSION`, `PYTHON_VERSION`, `SDKMAN_VERSION`, `JAVA_VERSION`, `DUCKDB_VERSION`, `OPENCODE_VERSION`, `CLAUDE_CLI_VERSION`, `PI_VERSION`, `OMP_VERSION`, `CLOUDFLARED_VERSION`, `GH_VERSION`, `CADDY_VERSION`
+- **Tools**: `MISE_VERSION`, `HERDR_VERSION`, `RUSTUP_VERSION`, `RUST_TOOLCHAIN`, `GO_VERSION`, `BUN_VERSION`, `NODE_VERSION`, `UV_VERSION`, `PYTHON_VERSION`, `SDKMAN_VERSION`, `JAVA_VERSION`, `DUCKDB_VERSION`, `OPENCODE_VERSION`, `CLAUDE_CLI_VERSION`, `PI_VERSION`, `OMP_VERSION`, `CLOUDFLARED_VERSION`, `GH_VERSION`, `CADDY_VERSION`, `EZA_VERSION`, `BAT_VERSION`
 - **User**: `USERNAME`, `USER_UID`, `USER_GID`
 
 ### Build (local)

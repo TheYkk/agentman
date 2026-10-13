@@ -28,9 +28,16 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up mise
+        uses: jdx/mise-action@v2
+        with:
+          install: false
+
       - name: Update docker-bake.hcl
         id: update
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           python scripts/check-bake-versions.py --update
@@ -81,6 +88,8 @@ jobs:
       - name: Build (and push) dev image
         if: steps.update.outputs.changed == 'true'
         uses: docker/bake-action@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           files: docker-bake.hcl
           targets: agentman
