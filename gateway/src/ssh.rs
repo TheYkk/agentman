@@ -546,11 +546,18 @@ impl Handler for ConnectionHandler {
             .ok_or_else(|| anyhow!("No project specified"))?;
 
         // Get or create container
-        let container_id = self
+        let container_id = match self
             .server
             .runtime
             .get_or_create_sandbox(github_user, project)
-            .await?;
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                report_provisioning_error(channel_id, session, github_user, project, &e)?;
+                return Ok(());
+            }
+        };
 
         self.container_id = Some(container_id.clone());
 
@@ -733,11 +740,18 @@ impl Handler for ConnectionHandler {
         }
 
         // Get or create container
-        let container_id = self
+        let container_id = match self
             .server
             .runtime
             .get_or_create_sandbox(github_user, project)
-            .await?;
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                report_provisioning_error(channel_id, session, github_user, project, &e)?;
+                return Ok(());
+            }
+        };
 
         self.container_id = Some(container_id.clone());
 
@@ -1067,11 +1081,21 @@ impl Handler for ConnectionHandler {
         let container_id = match self.container_id.clone() {
             Some(id) => id,
             None => {
-                let id = self
+                let id = match self
                     .server
                     .runtime
                     .get_or_create_sandbox(github_user, project)
-                    .await?;
+                    .await
+                {
+                    Ok(id) => id,
+                    Err(e) => {
+                        warn!(
+                            "Failed to provision sandbox for {}/{}: {:#}",
+                            github_user, project, e
+                        );
+                        return Ok(false);
+                    }
+                };
                 self.container_id = Some(id.clone());
                 id
             }
@@ -1388,6 +1412,29 @@ impl ConnectionHandler {
 
         Ok(())
     }
+}
+
+/// Tell the client why its sandbox could not be provisioned, instead of dropping the channel.
+///
+/// Accepts the shell/exec request, writes the full error chain to stderr, and exits with 1.
+fn report_provisioning_error(
+    channel_id: ChannelId,
+    session: &mut Session,
+    github_user: &str,
+    project: &str,
+    err: &anyhow::Error,
+) -> Result<()> {
+    warn!(
+        "Failed to provision sandbox for {}/{}: {:#}",
+        github_user, project, err
+    );
+    let msg = format!("agentman: failed to start sandbox {project}: {err:#}\r\n");
+    session.channel_success(channel_id)?;
+    session.extended_data(channel_id, 1, CryptoVec::from_slice(msg.as_bytes()))?;
+    session.exit_status_request(channel_id, 1)?;
+    session.eof(channel_id)?;
+    session.close(channel_id)?;
+    Ok(())
 }
 
 /// Check if a hostname refers to localhost.

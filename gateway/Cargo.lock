@@ -55,6 +55,7 @@ dependencies = [
  "clap",
  "dirs",
  "futures",
+ "hyper",
  "libc",
  "reqwest",
  "russh",

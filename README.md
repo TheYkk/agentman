@@ -222,7 +222,7 @@ Instead of Docker, the gateway can run each sandbox as an **LXC container on Pro
 How it works:
 - The gateway runs **as root on the Proxmox node** that hosts the containers.
 - Lifecycle (create, start, shutdown, destroy, status, stats) goes through the **Proxmox VE API** with an API token.
-- The workspace is bind-mounted at `/workspace` with `pct set <vmid> --mp0 ...` (Proxmox only lets `root@pam` add bind mounts, which API tokens cannot do).
+- The workspace is bind-mounted at `/workspace` and feature flags are set with `pct set <vmid> --mp0 ... --features ...` (Proxmox only lets `root@pam` add bind mounts or change features other than `nesting`, which API tokens cannot do).
 - Shells and commands are attached with `lxc-attach` and drop to UID/GID 1000 (`exec_uid`/`exec_gid`) with `setpriv --init-groups`, so the user keeps groups like `docker`. Interactive sessions get a real PTY and follow window resizes.
 - Docker inside the sandbox follows `[docker_in_sandbox] mode`: unless it is `off` (and by default, since LXC containers are unprivileged with nesting), containers get `features: nesting=1,keyctl=1` and the gateway starts `dockerd` as container root with `lxc-attach` on create and on every reconnect. Inner Docker data lives in the container's root filesystem, so it survives reconnects and restarts and is removed with `agentman destroy`.
 - `agentman pause` freezes the container with `lxc-freeze`; reconnecting unfreezes it.
@@ -239,13 +239,20 @@ Setup:
      and set `ostemplate = "local:vztmpl/agentman-base.tar.zst"`. If the node rejects the template's Debian version, set `ostype = "unmanaged"`; the template then configures `eth0` with DHCP itself.
    - *Proxmox VE 9.1+:* you can instead pull the image as an OCI template (Datacenter → Storage → CT Templates → *Pull from OCI Registry*, e.g. `ghcr.io/theykk/agentman-base:latest`) and set `ostemplate` to the resulting volume. A plain `docker export` without an init does not boot on any version.
    - Any other LXC template works as long as it has a user with UID 1000 and the tools you need (`bash`, `tmux`, `socat` for `ssh -L`, `setpriv`, and `dockerd` for Docker inside).
-2. **API token.** Create a user and token with enough rights to manage containers:
+2. **API token.** Give a dedicated user exactly what container management needs, scoped to a resource pool. New containers are created *into* the pool, so the token never needs rights on individual `/vms/<id>` paths and any free VMID works:
    ```bash
+   pveum pool add agentman
+   pveum role add AgentmanGateway --privs "VM.Allocate VM.Audit VM.Config.CPU VM.Config.Disk VM.Config.Memory VM.Config.Network VM.Config.Options VM.PowerMgmt Datastore.AllocateSpace Datastore.Audit SDN.Use Sys.Audit"
    pveum user add agentman@pve
-   pveum acl modify / --users agentman@pve --roles PVEVMAdmin,PVEDatastoreUser,PVESDNUser
+   pveum acl modify /pool/agentman                 --users agentman@pve --roles AgentmanGateway
+   pveum acl modify /storage/local-lvm             --users agentman@pve --roles AgentmanGateway  # rootfs storage
+   pveum acl modify /storage/local                 --users agentman@pve --roles AgentmanGateway  # template storage
+   pveum acl modify /sdn/zones/localnetwork/vmbr0  --users agentman@pve --roles AgentmanGateway  # bridge for net0
+   pveum acl modify /nodes/$(hostname -s)          --users agentman@pve --roles AgentmanGateway  # task status
    pveum user token add agentman@pve gateway --privsep 0   # prints the secret
    install -m 600 /dev/stdin /etc/agentman/proxmox-token <<< 'SECRET'
    ```
+   Set `pool = "agentman"` in `[proxmox]`: without it, Proxmox checks `VM.Allocate` on `/vms/<new id>` and a pool-scoped token cannot create containers. (The simpler alternative is one ACL on `/` with `PVEVMAdmin,PVEDatastoreUser,PVESDNUser`, which then covers every VM on the cluster.) Bind mounts and feature flags other than `nesting` are applied with `pct` as root on the node, because Proxmox refuses them for API tokens.
 3. **Config** (`/etc/agentman/gateway.toml`):
    ```toml
    runtime = "proxmox"
@@ -255,12 +262,14 @@ Setup:
    token_id = "agentman@pve!gateway"
    token_secret_file = "/etc/agentman/proxmox-token"  # or AGENTMAN_PROXMOX_TOKEN_SECRET
    ca_cert = "/etc/pve/pve-root-ca.pem"              # the cluster CA every node has
-   ostemplate = "local:vztmpl/agentman-base_latest.tar"
+   ostemplate = "local:vztmpl/agentman-base.tar.zst"
+   pool = "agentman"
    storage = "local-lvm"
    rootfs_size_gb = 16
    bridge = "vmbr0"
    ip = "dhcp"
    ```
+   If the node's API certificate is expired or not signed by `ca_cert`, the gateway says so in its error; renew it with `pvecm updatecerts --force` (then `systemctl restart pveproxy`). `insecure_skip_tls_verify = true` is for testing only.
    `container_security.memory_limit` and `cpu_limit` map to the container's memory and cores/cpulimit; without a memory limit, `default_memory_mb` (4096) is used.
 4. **Service.** Use `gateway/examples/agentman-gateway-proxmox.service` (it runs as root without the Docker-specific sandboxing, since `pct` and `lxc-attach` need it).
 

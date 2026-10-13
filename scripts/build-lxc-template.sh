@@ -104,7 +104,7 @@ EOF
 tag="agentman-lxc-template:build-$$"
 docker build --pull=false -t "$tag" "$ctx"
 cid="$(docker create "$tag")"
-docker export "$cid" | zstd -T0 -19 -q -o "$OUTPUT" -f
+docker export "$cid" | zstd -T0 -3 -q -o "$OUTPUT" -f
 docker rmi "$tag" >/dev/null 2>&1 || true
 
 echo "Wrote $OUTPUT"

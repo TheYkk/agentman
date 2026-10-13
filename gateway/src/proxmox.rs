@@ -104,18 +104,40 @@ impl ProxmoxApi {
             req.form(params)
         };
 
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("Proxmox API {method} {path} failed"))?;
+        let resp = match req.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let err = anyhow::Error::new(e);
+                let chain = format!("{err:#}");
+                let err = err.context(format!("Proxmox API {method} {path} failed"));
+                if chain.contains("certificate") || chain.contains("Certificate") {
+                    return Err(err.context(
+                        "TLS verification of the Proxmox API failed: the certificate is invalid \
+                         or expired, or not signed by proxmox.ca_cert. Renew it (pvecm updatecerts) \
+                         or point ca_cert at the right CA; insecure_skip_tls_verify = true only for testing",
+                    ));
+                }
+                return Err(err);
+            }
+        };
         let status = resp.status();
+        // Proxmox puts the error message in the HTTP reason phrase, not always in the body.
+        let reason = resp
+            .extensions()
+            .get::<hyper::ext::ReasonPhrase>()
+            .map(|r| String::from_utf8_lossy(r.as_bytes()).trim().to_string());
         let body = resp.text().await.unwrap_or_default();
 
         if !status.is_success() {
-            bail!(
-                "Proxmox API {method} {path} returned {status}: {}",
-                api_error_message(&body)
-            );
+            let mut msg = api_error_message(&body);
+            if let Some(reason) = reason.filter(|r| !r.is_empty() && !msg.contains(r.as_str())) {
+                msg = if msg.is_empty() {
+                    reason
+                } else {
+                    format!("{reason}; {msg}")
+                };
+            }
+            bail!("Proxmox API {method} {path} returned {}: {msg}", status.as_u16());
         }
 
         let v: Value = serde_json::from_str(&body)
@@ -201,7 +223,12 @@ fn api_error_message(body: &str) -> String {
         }
     }
     if parts.is_empty() {
-        body.trim().to_string()
+        // `{"data":null}` carries nothing; the message is then in the HTTP reason phrase.
+        if v.get("data").is_some_and(Value::is_null) {
+            String::new()
+        } else {
+            body.trim().to_string()
+        }
     } else {
         parts.join("; ")
     }
@@ -659,9 +686,6 @@ impl ProxmoxManager {
             ("onboot", "0".to_string()),
             ("start", "0".to_string()),
         ];
-        if let Some(features) = pcfg.features(self.inner_docker) {
-            params.push(("features", features));
-        }
         if let Some(cpu) = security.cpu_limit {
             params.push(("cores", (cpu.ceil().max(1.0) as u64).to_string()));
             params.push(("cpulimit", format!("{cpu}")));
@@ -726,18 +750,21 @@ impl ProxmoxManager {
             return Err(e.context(format!("Failed to create container {hostname}")));
         }
 
-        // Bind mount the persistent workspace. Proxmox only lets root@pam add bind mounts,
-        // so this goes through `pct` on the node rather than the API token.
+        // Bind mount the persistent workspace and set feature flags. Proxmox only lets root@pam
+        // add bind mounts and change features other than nesting, which API tokens cannot do,
+        // so this goes through `pct` on the node.
         let mp0 = format!("{},mp={}", workspace_path.display(), WORKSPACE_MOUNT);
-        if let Err(e) = self
-            .run_tool(&self.pcfg().pct_path, &["set", &vmid, "--mp0", &mp0])
-            .await
-        {
+        let mut pct_args = vec!["set", vmid.as_str(), "--mp0", mp0.as_str()];
+        let features = self.pcfg().features(self.inner_docker);
+        if let Some(ref features) = features {
+            pct_args.extend(["--features", features.as_str()]);
+        }
+        if let Err(e) = self.run_tool(&self.pcfg().pct_path, &pct_args).await {
             warn!("Removing container {} after failed setup", vmid);
             if let Err(e2) = self.delete_ct(&vmid).await {
                 warn!("Cleanup of container {} failed: {:#}", vmid, e2);
             }
-            return Err(e.context("Failed to bind-mount the workspace"));
+            return Err(e.context("Failed to configure the container (bind mount/features)"));
         }
 
         let upid = self
@@ -1189,5 +1216,6 @@ mod tests {
             "vmid: VM 100 already exists"
         );
         assert_eq!(api_error_message("plain failure"), "plain failure");
+        assert_eq!(api_error_message(r#"{"data": null}"#), "");
     }
 }

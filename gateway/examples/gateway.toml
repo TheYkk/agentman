@@ -103,6 +103,8 @@ swap_mb = 512
 bridge = "vmbr0"
 ip = "dhcp"
 # gateway = "10.0.0.1"   # with a static ip
+# Resource pool to create containers in. Needed when the API token is scoped to a pool
+# (see README); otherwise the token needs VM.Allocate on /vms/<id>.
 # pool = "agentman"
 
 unprivileged = true
