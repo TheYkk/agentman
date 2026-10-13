@@ -189,10 +189,13 @@ RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN \
  && uv --version
 
 # Coding agents (npm packages need Node.js from the step above; omp runs on Bun).
+# opencode and Claude Code fetch their native binary in a postinstall script, which mise skips unless
+# it shells out to npm and the tool opts in to install scripts.
 RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN \
-    mise use -g \
-      "npm:@opencode/cli@${OPENCODE_VERSION}" \
-      "npm:@anthropic-ai/claude-code@${CLAUDE_CLI_VERSION}" \
+    mise settings set npm.shell_out true \
+ && mise use -g \
+      "npm:@opencode/cli[npm_args=--ignore-scripts=false]@${OPENCODE_VERSION}" \
+      "npm:@anthropic-ai/claude-code[npm_args=--ignore-scripts=false]@${CLAUDE_CLI_VERSION}" \
       "npm:@earendil-works/pi-coding-agent@${PI_VERSION}" \
       "npm:@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
  && opencode --version \
