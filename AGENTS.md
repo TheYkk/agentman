@@ -70,7 +70,9 @@ Derived from `Dockerfile` + `docker-bake.hcl`:
  - **Node.js** (pinned)
   - **uv/uvx** (`0.9.22`) + **Python** installed via `uv python install` (default `3.13`)
   - **DuckDB CLI** (`1.4.3`)
-  - **opencode** (`v1.1.7`)
+  - **opencode** v2 (default agent, opened in a herdr workspace on start)
+  - **Claude Code** (`claude`), **pi** (`pi`), **omp** (`omp`, oh-my-pi)
+  - **cloudflared** (Cloudflare Tunnel client)
   - **herdr** (`v0.9.4`) (default `CMD` is `herdr server` under `tini`; attach with `herdr`)
 - **Database CLIs**:
   - `duckdb`, `psql` (postgresql-client), `mysql` (default-mysql-client), `sqlite3`

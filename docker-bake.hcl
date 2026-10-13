@@ -19,7 +19,11 @@ variable "PYTHON_VERSION" { default = "3.13" }
 variable "SDKMAN_VERSION" { default = "5.23.2" }
 variable "JAVA_VERSION"   { default = "21.0.12-tem" }
 variable "DUCKDB_VERSION" { default = "1.5.6" }
-variable "OPENCODE_VERSION" { default = "v1.19.0" }
+variable "OPENCODE_VERSION" { default = "2.0.28" }
+variable "CLAUDE_CLI_VERSION"  { default = "2.1.296" }
+variable "PI_VERSION"       { default = "1.2.0" }
+variable "OMP_VERSION"      { default = "18.10.3" }
+variable "CLOUDFLARED_VERSION" { default = "2026.10.0" }
 
 variable "USERNAME"      { default = "agent" }
 variable "USER_UID"      { default = "1000" }
@@ -56,6 +60,10 @@ target "agentman" {
     JAVA_VERSION     = "${JAVA_VERSION}"
     DUCKDB_VERSION   = "${DUCKDB_VERSION}"
     OPENCODE_VERSION = "${OPENCODE_VERSION}"
+    CLAUDE_CLI_VERSION = "${CLAUDE_CLI_VERSION}"
+    PI_VERSION       = "${PI_VERSION}"
+    OMP_VERSION      = "${OMP_VERSION}"
+    CLOUDFLARED_VERSION = "${CLOUDFLARED_VERSION}"
 
     USERNAME         = "${USERNAME}"
     USER_UID         = "${USER_UID}"

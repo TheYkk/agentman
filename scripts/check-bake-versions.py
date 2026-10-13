@@ -96,6 +96,16 @@ def _github_latest_tag(owner: str, repo: str) -> str:
     return tag.strip()
 
 
+def _npm_latest_version(package: str) -> str:
+    data = _http_get_json(
+        f"https://registry.npmjs.org/{package.replace('/', '%2f')}/latest",
+        headers={"Accept": "application/json"},
+    )
+    if not isinstance(data, dict) or not isinstance(data.get("version"), str):
+        raise RuntimeError(f"Unexpected npm registry response for {package}")
+    return data["version"].strip()
+
+
 def _github_latest_tag_from_tags_api(owner: str, repo: str) -> str:
     data = _http_get_json(f"https://api.github.com/repos/{owner}/{repo}/tags?per_page=100")
     if not isinstance(data, list) or not data:
@@ -280,6 +290,21 @@ def _check_debian_tag(current: str) -> Check:
         return Check("DEBIAN_TAG", current, None, "unknown", "deb.debian.org", str(e))
 
 
+def _check_npm_version(*, name: str, current: str, package: str) -> Check:
+    source = f"npm:{package}"
+    try:
+        latest = _npm_latest_version(package)
+        cur_num = _parse_ints(current)
+        latest_num = _parse_ints(latest)
+        if cur_num is not None and latest_num is not None:
+            status: Status = "ok" if cur_num == latest_num else "outdated"
+        else:
+            status = "ok" if current == latest else "outdated"
+        return Check(name, current, latest, status, source)
+    except Exception as e:
+        return Check(name, current, None, "unknown", source, str(e))
+
+
 def _check_github_version(
     *,
     name: str,
@@ -447,7 +472,11 @@ def _checks_for(bake_vars: dict[str, str]) -> list[Check]:
     checks.append(_check_github_version(name="SDKMAN_VERSION", current=cur("SDKMAN_VERSION"), owner="sdkman", repo="sdkman-cli", strip=("v",)))
     checks.append(_check_java_version(cur("JAVA_VERSION")))
     checks.append(_check_github_version(name="DUCKDB_VERSION", current=cur("DUCKDB_VERSION"), owner="duckdb", repo="duckdb", strip=("v",)))
-    checks.append(_check_github_version(name="OPENCODE_VERSION", current=cur("OPENCODE_VERSION"), owner="anomalyco", repo="opencode"))
+    checks.append(_check_npm_version(name="OPENCODE_VERSION", current=cur("OPENCODE_VERSION"), package="@opencode/cli"))
+    checks.append(_check_npm_version(name="CLAUDE_CLI_VERSION", current=cur("CLAUDE_CLI_VERSION"), package="@anthropic-ai/claude-code"))
+    checks.append(_check_npm_version(name="PI_VERSION", current=cur("PI_VERSION"), package="@earendil-works/pi-coding-agent"))
+    checks.append(_check_npm_version(name="OMP_VERSION", current=cur("OMP_VERSION"), package="@oh-my-pi/pi-coding-agent"))
+    checks.append(_check_github_version(name="CLOUDFLARED_VERSION", current=cur("CLOUDFLARED_VERSION"), owner="cloudflare", repo="cloudflared"))
     checks.append(_check_github_version(name="HERDR_VERSION", current=cur("HERDR_VERSION"), owner="herdrdev", repo="herdr"))
 
     return checks

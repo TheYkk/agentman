@@ -12,14 +12,18 @@ ARG HERDR_VERSION=v0.9.4
 ARG RUSTUP_VERSION=1.27.1
 ARG RUST_TOOLCHAIN=1.92.0
 ARG GO_VERSION=1.25.5
-ARG BUN_VERSION=1.3.5
+ARG BUN_VERSION=1.4.3
 ARG NODE_VERSION=22.13.1
 ARG UV_VERSION=0.9.22
 ARG PYTHON_VERSION=3.13
 ARG SDKMAN_VERSION=5.20.0
 ARG JAVA_VERSION=21.0.9-tem
 ARG DUCKDB_VERSION=1.4.3
-ARG OPENCODE_VERSION=v1.1.7
+ARG OPENCODE_VERSION=2.0.28
+ARG CLAUDE_CLI_VERSION=2.1.296
+ARG PI_VERSION=1.2.0
+ARG OMP_VERSION=18.10.3
+ARG CLOUDFLARED_VERSION=2026.10.0
 
 # User config
 ARG USERNAME=agent
@@ -28,7 +32,8 @@ ARG USER_GID=1000
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
-    LC_ALL=C.UTF-8
+    LC_ALL=C.UTF-8 \
+    SHELL=/bin/bash
 
 # `bsdmainutils` may be absent on newer Debian releases; fall back to `bsdextrautils`.
 RUN apt-get update \
@@ -111,6 +116,18 @@ RUN arch="$(dpkg --print-architecture)" \
  && rm -f /tmp/herdr \
  && herdr --version
 
+# --- cloudflared (pinned) ---
+# Cloudflare Tunnel client, for exposing services in the container without opening ports.
+RUN arch="$(dpkg --print-architecture)" \
+ && case "${arch}" in \
+      amd64|arm64) cf_arch="${arch}" ;; \
+      *) echo "Unsupported dpkg architecture: ${arch}" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL -o /tmp/cloudflared "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${cf_arch}" \
+ && install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared \
+ && rm -f /tmp/cloudflared \
+ && cloudflared --version
+
 # --- DuckDB CLI (pinned) ---
 RUN arch="$(dpkg --print-architecture)" \
  && case "${arch}" in \
@@ -185,7 +202,8 @@ RUN arch="$(dpkg --print-architecture)" \
  && rm -rf /tmp/uv.tar.gz "/tmp/uv-${uv_triple}" \
  && uv --version
 
-# --- opencode (pinned) ---
+# --- opencode v2 (pinned) ---
+# OpenCode 2 ships per-platform CLI binaries as npm tarballs (the same source as https://opencode.ai/v2/install).
 RUN arch="$(dpkg --print-architecture)" \
  && case "${arch}" in \
       amd64) oc_arch="x64" ;; \
@@ -193,11 +211,26 @@ RUN arch="$(dpkg --print-architecture)" \
       *) echo "Unsupported dpkg architecture: ${arch}" >&2; exit 1 ;; \
     esac \
  && tmpdir="$(mktemp -d)" \
- && curl -fsSL -o /tmp/opencode.tar.gz "https://github.com/anomalyco/opencode/releases/download/${OPENCODE_VERSION}/opencode-linux-${oc_arch}.tar.gz" \
- && tar -C "${tmpdir}" -xzf /tmp/opencode.tar.gz \
- && install -m 0755 "${tmpdir}/opencode" /usr/local/bin/opencode \
- && rm -rf "${tmpdir}" /tmp/opencode.tar.gz \
- && opencode --version || true
+ && curl -fsSL -o "${tmpdir}/opencode.tgz" "https://registry.npmjs.org/@opencode/cli-linux-${oc_arch}/-/cli-linux-${oc_arch}-${OPENCODE_VERSION}.tgz" \
+ && tar -C "${tmpdir}" -xzf "${tmpdir}/opencode.tgz" \
+ && install -m 0755 "${tmpdir}/package/bin/opencode" /usr/local/bin/opencode \
+ && rm -rf "${tmpdir}" \
+ && opencode --version
+
+# --- Claude Code, pi, omp (pinned, global npm packages) ---
+# omp runs on Bun; Claude Code and pi run on Node.js. Installed root-owned, so self-updates are disabled below.
+RUN npm install -g --no-fund --no-audit \
+      "@anthropic-ai/claude-code@${CLAUDE_CLI_VERSION}" \
+      "@earendil-works/pi-coding-agent@${PI_VERSION}" \
+      "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
+ && npm cache clean --force \
+ && ln -sf /usr/local/node/bin/claude /usr/local/bin/claude \
+ && ln -sf /usr/local/node/bin/pi /usr/local/bin/pi \
+ && ln -sf /usr/local/node/bin/omp /usr/local/bin/omp \
+ && claude --version \
+ && pi --version \
+ && omp --version
+ENV DISABLE_AUTOUPDATER=1
 
 # --- SSH Server Setup (as root) ---
 RUN mkdir -p /var/run/sshd \
@@ -292,12 +325,18 @@ RUN mkdir -p "${SDKMAN_DIR}/var" \
 RUN printf '\n# SDKMAN\nexport SDKMAN_DIR=\"$HOME/.sdkman\"\n[[ -s \"$SDKMAN_DIR/bin/sdkman-init.sh\" ]] && source \"$SDKMAN_DIR/bin/sdkman-init.sh\"\n' \
  | tee -a "${HOME}/.bashrc" "${HOME}/.profile" >/dev/null
 
+# --- herdr agent integrations ---
+# Lets herdr track agent state (working, blocked, done) for each installed agent.
+RUN mkdir -p "${HOME}/.config/opencode" "${HOME}/.claude" "${HOME}/.pi/agent/extensions" "${HOME}/.omp/agent/extensions" \
+ && for agent in opencode claude pi omp; do herdr integration install "${agent}"; done
+
 # Copy scripts (switch to root temporarily for installation)
 USER root
 COPY scripts/setup-ssh-keys.sh /usr/local/bin/setup-ssh-keys.sh
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/setup-ssh-keys.sh /usr/local/bin/docker-entrypoint.sh \
- && chown root:root /usr/local/bin/setup-ssh-keys.sh /usr/local/bin/docker-entrypoint.sh
+COPY scripts/herdr-default-agent.sh /usr/local/bin/herdr-default-agent.sh
+RUN chmod +x /usr/local/bin/setup-ssh-keys.sh /usr/local/bin/docker-entrypoint.sh /usr/local/bin/herdr-default-agent.sh \
+ && chown root:root /usr/local/bin/setup-ssh-keys.sh /usr/local/bin/docker-entrypoint.sh /usr/local/bin/herdr-default-agent.sh
 
 # Create pre_workspace folder for files that should be copied to /workspace on container start
 RUN mkdir -p /pre_workspace \
@@ -312,4 +351,6 @@ USER ${USERNAME}
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
 
 # herdr's headless server is the container's main process; attach with `herdr` (e.g. over SSH).
+# On start, the entrypoint opens a workspace in /workspace running AGENTMAN_DEFAULT_AGENT (empty disables it).
+ENV AGENTMAN_DEFAULT_AGENT=opencode
 CMD ["herdr", "server"]

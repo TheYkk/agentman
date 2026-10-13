@@ -10,7 +10,9 @@ Debian-based base image for a coding agent with pinned versions of:
 - **uv** + **Python** installed via `uv python install`
 - **Java** (via SDKMAN, pinned)
 - **DuckDB** (CLI)
-- **opencode**
+- **opencode** v2 (default agent: opened in a herdr workspace in `/workspace` on start)
+- **Claude Code**, **pi** and **omp** (oh-my-pi) coding agents, with herdr integrations installed for all four
+- **cloudflared** (Cloudflare Tunnel client)
 
 Python is installed using uv per the official guide: `https://docs.astral.sh/uv/guides/install-python/`.
 
@@ -309,7 +311,7 @@ Note: `agentman exec <cmd>` is accepted as an alias (e.g. `agentman exec stats -
 
 Edit `docker-bake.hcl` (the `variable` defaults near the top), or override via environment variables:
 - **Base image**: `DEBIAN_TAG`
-- **Tools**: `HERDR_VERSION`, `RUSTUP_VERSION`, `RUST_TOOLCHAIN`, `GO_VERSION`, `BUN_VERSION`, `NODE_VERSION`, `UV_VERSION`, `PYTHON_VERSION`, `SDKMAN_VERSION`, `JAVA_VERSION`, `DUCKDB_VERSION`, `OPENCODE_VERSION`
+- **Tools**: `HERDR_VERSION`, `RUSTUP_VERSION`, `RUST_TOOLCHAIN`, `GO_VERSION`, `BUN_VERSION`, `NODE_VERSION`, `UV_VERSION`, `PYTHON_VERSION`, `SDKMAN_VERSION`, `JAVA_VERSION`, `DUCKDB_VERSION`, `OPENCODE_VERSION`, `CLAUDE_CLI_VERSION`, `PI_VERSION`, `OMP_VERSION`, `CLOUDFLARED_VERSION`
 - **User**: `USERNAME`, `USER_UID`, `USER_GID`
 
 ### Build (local)
@@ -325,6 +327,8 @@ Run the image (defaults to running `herdr server` under `tini`):
 ```bash
 docker run -d --name agentman agentman-base:dev
 ```
+
+On start, opencode is opened in a herdr workspace in `/workspace`. Pick another agent with `-e AGENTMAN_DEFAULT_AGENT=claude` (or `pi`, `omp`), or set it to an empty value to start with no agent.
 
 Attach to the herdr session (inside the container, or over SSH):
 
