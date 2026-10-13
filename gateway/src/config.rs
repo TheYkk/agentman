@@ -202,20 +202,18 @@ impl Default for ContainerSecurityConfig {
     }
 }
 
-/// How (and whether) each sandbox gets its own Docker daemon.
+/// Whether each sandbox gets its own Docker daemon. Shared by every sandbox backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DockerInSandboxMode {
-    /// Use sysbox if the host Docker daemon has the sysbox runtime, otherwise disable.
+    /// Enable when the backend can isolate it without extra privileges: the Docker backend
+    /// needs the sysbox runtime, an LXC backend needs an unprivileged container with nesting.
     Auto,
+    /// Always enable. The Docker backend uses `docker_isolation`; startup fails if that
+    /// isolation is unavailable.
+    On,
     /// No Docker daemon inside sandboxes.
     Off,
-    /// Run sandboxes under the sysbox runtime (user-namespaced, no `--privileged`).
-    /// Fails at startup if the runtime is not registered with the host Docker daemon.
-    Sysbox,
-    /// Run sandboxes with `--privileged`. Root in the sandbox is effectively root on the host;
-    /// only use this for fully trusted users.
-    Privileged,
 }
 
 impl Default for DockerInSandboxMode {
@@ -224,18 +222,39 @@ impl Default for DockerInSandboxMode {
     }
 }
 
+/// How the Docker backend isolates a sandbox that runs its own Docker daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DockerIsolation {
+    /// Run under the sysbox runtime (user-namespaced, no `--privileged`).
+    Sysbox,
+    /// Run with `--privileged`. Root in the sandbox is effectively root on the host;
+    /// only use this for fully trusted users.
+    Privileged,
+}
+
+impl Default for DockerIsolation {
+    fn default() -> Self {
+        Self::Sysbox
+    }
+}
+
 /// Docker-in-sandbox configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DockerInSandboxConfig {
-    /// Which isolation mode to use (see [`DockerInSandboxMode`]).
+    /// Whether sandboxes run their own Docker daemon (see [`DockerInSandboxMode`]).
     pub mode: DockerInSandboxMode,
 
-    /// Name of the sysbox runtime registered with the host Docker daemon.
+    /// Docker backend only: isolation used when the mode is `on`.
+    pub docker_isolation: DockerIsolation,
+
+    /// Docker backend only: name of the sysbox runtime registered with the host Docker daemon.
     pub sysbox_runtime: String,
 
-    /// Keep the inner Docker data (`/var/lib/docker`: images, build cache, volumes) in a
-    /// per-workspace named volume so it survives container recreation.
+    /// Docker backend only: keep the inner Docker data (`/var/lib/docker`: images, build cache,
+    /// volumes) in a per-workspace named volume so it survives container recreation.
+    /// LXC sandboxes keep it in their persistent root filesystem.
     pub persist_data: bool,
 }
 
@@ -243,6 +262,7 @@ impl Default for DockerInSandboxConfig {
     fn default() -> Self {
         Self {
             mode: DockerInSandboxMode::Auto,
+            docker_isolation: DockerIsolation::Sysbox,
             sysbox_runtime: "sysbox-runc".to_string(),
             persist_data: true,
         }
@@ -314,6 +334,7 @@ mod tests {
     fn docker_in_sandbox_defaults_to_auto() {
         let config: GatewayConfig = toml::from_str("").unwrap();
         assert_eq!(config.docker_in_sandbox.mode, DockerInSandboxMode::Auto);
+        assert_eq!(config.docker_in_sandbox.docker_isolation, DockerIsolation::Sysbox);
         assert_eq!(config.docker_in_sandbox.sysbox_runtime, "sysbox-runc");
         assert!(config.docker_in_sandbox.persist_data);
     }
@@ -323,12 +344,17 @@ mod tests {
         for (raw, mode) in [
             ("auto", DockerInSandboxMode::Auto),
             ("off", DockerInSandboxMode::Off),
-            ("sysbox", DockerInSandboxMode::Sysbox),
-            ("privileged", DockerInSandboxMode::Privileged),
+            ("on", DockerInSandboxMode::On),
         ] {
             let config: GatewayConfig =
                 toml::from_str(&format!("[docker_in_sandbox]\nmode = \"{raw}\"\n")).unwrap();
             assert_eq!(config.docker_in_sandbox.mode, mode);
         }
+
+        let config: GatewayConfig = toml::from_str(
+            "[docker_in_sandbox]\nmode = \"on\"\ndocker_isolation = \"privileged\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.docker_in_sandbox.docker_isolation, DockerIsolation::Privileged);
     }
 }
