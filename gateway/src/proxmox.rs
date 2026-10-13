@@ -26,11 +26,11 @@ use tokio::process::Command;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::config::{GatewayConfig, ProxmoxConfig, RuntimeKind};
+use crate::config::{DockerInSandboxMode, GatewayConfig, ProxmoxConfig, RuntimeKind};
 use crate::docker::{ensure_workspace_writable, parse_memory_limit};
 use crate::pty::{make_controlling_terminal, open_pty, PtyReader, PtyWriter};
 use crate::runtime::{
-    DestroyOptions, DestroyResult, ExecOutput, ExecProcess, ExecSpec, Resizer, SandboxStats,
+    start_dockerd_script, DestroyOptions, DestroyResult, ExecOutput, ExecProcess, ExecSpec, Resizer, SandboxStats,
     SandboxStatus,
 };
 use crate::state::{StateManager, WorkspaceInfo};
@@ -40,6 +40,10 @@ const AGENTMAN_TAG: &str = "agentman";
 
 /// Where the workspace is mounted inside the container.
 const WORKSPACE_MOUNT: &str = "/workspace";
+
+/// Tag marking containers created with Docker-in-sandbox (the LXC analogue of the
+/// `agentman.inner_docker` Docker label).
+const INNER_DOCKER_TAG: &str = "agentman-dind";
 
 /// Minimal Proxmox VE API client authenticated with an API token.
 struct ProxmoxApi {
@@ -308,6 +312,15 @@ fn lxc_attach_args(cfg: &ProxmoxConfig, vmid: &str, env: &[String], cmd: &[Strin
     args
 }
 
+/// Create a directory (if needed) owned by `owner` on the host.
+async fn ensure_dir_owned(path: &Path, owner: (u32, u32)) -> Result<()> {
+    tokio::fs::create_dir_all(path)
+        .await
+        .with_context(|| format!("Failed to create {}", path.display()))?;
+    std::os::unix::fs::chown(path, Some(owner.0), Some(owner.1))
+        .with_context(|| format!("Failed to chown {}", path.display()))
+}
+
 /// Read a stream of byte chunks from an async reader.
 fn read_chunks<R>(reader: R, wrap: fn(Bytes) -> ExecOutput) -> BoxStream<'static, std::io::Result<ExecOutput>>
 where
@@ -394,6 +407,8 @@ pub struct ProxmoxManager {
     state: Arc<StateManager>,
     /// Per-container environment (GITHUB_USERNAME etc.), the LXC analogue of Docker's container env.
     container_env: RwLock<HashMap<String, Vec<String>>>,
+    /// Whether new containers run their own Docker daemon (`docker_in_sandbox.mode != off`).
+    inner_docker: bool,
 }
 
 impl ProxmoxManager {
@@ -426,12 +441,24 @@ impl ProxmoxManager {
             );
         }
 
+        // nesting + keyctl already let unprivileged LXC containers run Docker, so every mode
+        // except `off` simply turns the inner daemon on (sysbox/privileged are Docker-runtime terms).
+        let inner_docker = config.docker_in_sandbox.mode != DockerInSandboxMode::Off;
+        if inner_docker && !(pcfg.nesting && (pcfg.keyctl || !pcfg.unprivileged)) {
+            warn!("Docker inside sandboxes is on, but proxmox.nesting/keyctl are off; dockerd will likely fail");
+        }
+        info!(
+            "Docker inside sandboxes: {}",
+            if inner_docker { "on (LXC nesting)" } else { "off" }
+        );
+
         Ok(Self {
             api,
             node,
             config,
             state,
             container_env: RwLock::new(HashMap::new()),
+            inner_docker,
         })
     }
 
@@ -525,6 +552,9 @@ impl ProxmoxManager {
             } else if let Some(ref vmid) = workspace.container_id {
                 if let Some(ct) = self.find_ct(vmid).await? {
                     self.ensure_running(&ct).await?;
+                    if ct.tags.iter().any(|t| t == INNER_DOCKER_TAG) {
+                        self.ensure_inner_dockerd(vmid).await;
+                    }
                     self.remember_env(vmid, github_user, project, &workspace.container_name)
                         .await;
                     return Ok(vmid.clone());
@@ -612,7 +642,14 @@ impl ProxmoxManager {
             ("swap", pcfg.swap_mb.to_string()),
             ("net0", net0),
             ("unprivileged", if pcfg.unprivileged { "1" } else { "0" }.to_string()),
-            ("tags", AGENTMAN_TAG.to_string()),
+            (
+                "tags",
+                if self.inner_docker {
+                    format!("{AGENTMAN_TAG};{INNER_DOCKER_TAG}")
+                } else {
+                    AGENTMAN_TAG.to_string()
+                },
+            ),
             (
                 "description",
                 format!("Managed by agentman for {github_user}/{project}"),
@@ -687,11 +724,15 @@ impl ProxmoxManager {
         // Bind mount the persistent workspace. Proxmox only lets root@pam add bind mounts,
         // so this goes through `pct` on the node rather than the API token.
         let mp0 = format!("{},mp={}", workspace_path.display(), WORKSPACE_MOUNT);
-        let vmid_arg = vmid.as_str();
-        if let Err(e) = self
-            .run_tool(&self.pcfg().pct_path, &["set", vmid_arg, "--mp0", &mp0])
-            .await
-        {
+        let mut pct_args = vec!["set".to_string(), vmid.clone(), "--mp0".to_string(), mp0];
+        if let Some(data) = self.docker_data_path(github_user, project) {
+            // Keep the inner /var/lib/docker (images, build cache, volumes) across container recreation.
+            ensure_dir_owned(&data, self.pcfg().host_root_owner()).await?;
+            pct_args.push("--mp1".to_string());
+            pct_args.push(format!("{},mp=/var/lib/docker", data.display()));
+        }
+        let pct_args: Vec<&str> = pct_args.iter().map(String::as_str).collect();
+        if let Err(e) = self.run_tool(&self.pcfg().pct_path, &pct_args).await {
             warn!("Removing container {} after failed setup", vmid);
             if let Err(e2) = self.delete_ct(&vmid).await {
                 warn!("Cleanup of container {} failed: {:#}", vmid, e2);
@@ -723,7 +764,41 @@ impl ProxmoxManager {
             .await?;
 
         self.remember_env(&vmid, github_user, project, &hostname).await;
+        if self.inner_docker {
+            self.ensure_inner_dockerd(&vmid).await;
+        }
         Ok(vmid)
+    }
+
+    /// Host directory persisted as the container's `/var/lib/docker`, when enabled.
+    fn docker_data_path(&self, github_user: &str, project: &str) -> Option<PathBuf> {
+        (self.inner_docker && self.config.docker_in_sandbox.persist_data)
+            .then(|| self.config.docker_data_path(github_user, project))
+    }
+
+    /// Start the inner Docker daemon (as container root). Idempotent and best-effort: a failure
+    /// is logged and the session continues without Docker.
+    async fn ensure_inner_dockerd(&self, vmid: &str) {
+        let script = start_dockerd_script();
+        let run = Command::new(self.lxc_tool("lxc-attach"))
+            .args(["-n", vmid, "--clear-env", "--set-var"])
+            .arg("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+            .args(["--", "/bin/sh", "-c", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output();
+        match tokio::time::timeout(Duration::from_secs(30), run).await {
+            Ok(Ok(out)) if out.status.success() => {}
+            Ok(Ok(out)) => warn!(
+                "Failed to start dockerd in container {}: {}",
+                vmid,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Ok(Err(e)) => warn!("Failed to run lxc-attach for dockerd in {}: {}", vmid, e),
+            Err(_) => warn!("Timed out starting dockerd in container {}", vmid),
+        }
     }
 
     /// Start a process in the container with its I/O attached.
@@ -975,6 +1050,22 @@ impl ProxmoxManager {
             workspace_deleted = true;
         }
 
+        // Delete the persisted inner Docker data along with the workspace data. Looked up by path
+        // regardless of the current mode, so switching modes never strands it.
+        let mut removed_volumes = Vec::new();
+        let docker_data = self.config.docker_data_path(github_user, project);
+        if !opts.keep_workspace && docker_data.exists() {
+            let label = docker_data.display().to_string();
+            if opts.dry_run {
+                removed_volumes.push(format!("{label} (dry-run)"));
+            } else {
+                match tokio::fs::remove_dir_all(&docker_data).await {
+                    Ok(()) => removed_volumes.push(label),
+                    Err(e) => warnings.push(format!("remove docker data {label}: {e}")),
+                }
+            }
+        }
+
         // Remove the workspace entry from state.
         let state_entry_deleted = if opts.dry_run {
             false
@@ -991,6 +1082,7 @@ impl ProxmoxManager {
 
         Ok(DestroyResult {
             removed_containers,
+            removed_volumes,
             workspace_path,
             workspace_deleted,
             state_entry_deleted,

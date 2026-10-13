@@ -99,6 +99,10 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub container_security: ContainerSecurityConfig,
 
+    /// Running Docker inside each sandbox container
+    #[serde(default)]
+    pub docker_in_sandbox: DockerInSandboxConfig,
+
     /// Which runtime provisions sandboxes: Docker containers or Proxmox LXC containers.
     #[serde(default)]
     pub runtime: RuntimeKind,
@@ -266,6 +270,15 @@ impl Default for ProxmoxConfig {
 }
 
 impl ProxmoxConfig {
+    /// Host UID/GID that maps to root inside the container.
+    pub fn host_root_owner(&self) -> (u32, u32) {
+        if self.unprivileged {
+            (self.id_map_offset, self.id_map_offset)
+        } else {
+            (0, 0)
+        }
+    }
+
     /// Value for the container's `features` option, if any feature is enabled.
     pub fn features(&self) -> Option<String> {
         let mut features = Vec::new();
@@ -314,6 +327,7 @@ impl Default for GatewayConfig {
             agent_forwarding: AgentForwardingConfig::default(),
             shell: ShellConfig::default(),
             container_security: ContainerSecurityConfig::default(),
+            docker_in_sandbox: DockerInSandboxConfig::default(),
             runtime: RuntimeKind::default(),
             proxmox: ProxmoxConfig::default(),
         }
@@ -396,6 +410,53 @@ impl Default for ContainerSecurityConfig {
     }
 }
 
+/// How (and whether) each sandbox gets its own Docker daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DockerInSandboxMode {
+    /// Use sysbox if the host Docker daemon has the sysbox runtime, otherwise disable.
+    Auto,
+    /// No Docker daemon inside sandboxes.
+    Off,
+    /// Run sandboxes under the sysbox runtime (user-namespaced, no `--privileged`).
+    /// Fails at startup if the runtime is not registered with the host Docker daemon.
+    Sysbox,
+    /// Run sandboxes with `--privileged`. Root in the sandbox is effectively root on the host;
+    /// only use this for fully trusted users.
+    Privileged,
+}
+
+impl Default for DockerInSandboxMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+/// Docker-in-sandbox configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DockerInSandboxConfig {
+    /// Which isolation mode to use (see [`DockerInSandboxMode`]).
+    pub mode: DockerInSandboxMode,
+
+    /// Name of the sysbox runtime registered with the host Docker daemon.
+    pub sysbox_runtime: String,
+
+    /// Keep the inner Docker data (`/var/lib/docker`: images, build cache, volumes) in a
+    /// per-workspace named volume so it survives container recreation.
+    pub persist_data: bool,
+}
+
+impl Default for DockerInSandboxConfig {
+    fn default() -> Self {
+        Self {
+            mode: DockerInSandboxMode::Auto,
+            sysbox_runtime: "sysbox-runc".to_string(),
+            persist_data: true,
+        }
+    }
+}
+
 impl GatewayConfig {
     /// Load configuration from a TOML file.
     pub fn load(path: &Path) -> Result<Self> {
@@ -456,6 +517,17 @@ impl GatewayConfig {
         }
     }
 
+    /// Host directory holding a sandbox's inner `/var/lib/docker` on runtimes that bind-mount it
+    /// (Proxmox LXC), next to the workspace root.
+    pub fn docker_data_path(&self, github_user: &str, project: &str) -> PathBuf {
+        self.workspace_root
+            .parent()
+            .unwrap_or(&self.workspace_root)
+            .join("docker-data")
+            .join(github_user)
+            .join(project)
+    }
+
     /// Get the workspace path for a given GitHub user and project.
     pub fn workspace_path(&self, github_user: &str, project: &str) -> PathBuf {
         self.workspace_root.join(github_user).join(project)
@@ -480,5 +552,27 @@ mod tests {
         let config: GatewayConfig = toml::from_str("runtime = \"proxmox\"\n").unwrap();
         assert_eq!(config.runtime, RuntimeKind::Proxmox);
         assert_eq!(config.workspace_owner(), (101000, 101000));
+    }
+
+    #[test]
+    fn docker_in_sandbox_defaults_to_auto() {
+        let config: GatewayConfig = toml::from_str("").unwrap();
+        assert_eq!(config.docker_in_sandbox.mode, DockerInSandboxMode::Auto);
+        assert_eq!(config.docker_in_sandbox.sysbox_runtime, "sysbox-runc");
+        assert!(config.docker_in_sandbox.persist_data);
+    }
+
+    #[test]
+    fn docker_in_sandbox_parses_modes() {
+        for (raw, mode) in [
+            ("auto", DockerInSandboxMode::Auto),
+            ("off", DockerInSandboxMode::Off),
+            ("sysbox", DockerInSandboxMode::Sysbox),
+            ("privileged", DockerInSandboxMode::Privileged),
+        ] {
+            let config: GatewayConfig =
+                toml::from_str(&format!("[docker_in_sandbox]\nmode = \"{raw}\"\n")).unwrap();
+            assert_eq!(config.docker_in_sandbox.mode, mode);
+        }
     }
 }

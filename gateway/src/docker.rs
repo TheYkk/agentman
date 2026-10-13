@@ -5,6 +5,7 @@
 //! - Bind-mounting persistent workspaces
 //! - Applying security hardening
 //! - Container lifecycle (start, stop, exec)
+//! - Optional Docker daemon inside each sandbox (sysbox or privileged)
 
 use anyhow::{anyhow, Context, Result};
 use bollard::container::LogOutput;
@@ -13,7 +14,8 @@ use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecOptions, Star
 use bollard::models::{ContainerCreateBody, HostConfig};
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, InspectContainerOptions, ListContainersOptionsBuilder,
-    RemoveContainerOptionsBuilder, StartContainerOptions, StatsOptionsBuilder,
+    RemoveContainerOptionsBuilder, RemoveVolumeOptionsBuilder, StartContainerOptions,
+    StatsOptionsBuilder,
     StopContainerOptionsBuilder,
 };
 use bollard::Docker;
@@ -27,12 +29,62 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{info, warn};
 
-use crate::config::{GatewayConfig, RuntimeKind};
+use crate::config::{DockerInSandboxMode, GatewayConfig, RuntimeKind};
 use crate::runtime::{
-    DestroyOptions, DestroyResult, ExecOutput, ExecProcess, ExecSpec, Resizer, SandboxStats,
+    start_dockerd_script, DestroyOptions, DestroyResult, ExecOutput, ExecProcess, ExecSpec, Resizer, SandboxStats,
     SandboxStatus,
 };
 use crate::state::{StateManager, WorkspaceInfo};
+
+
+/// Container label recording which inner-Docker mode a sandbox was created with.
+const INNER_DOCKER_LABEL: &str = "agentman.inner_docker";
+
+/// Inner-Docker mode resolved against what the host Docker daemon supports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InnerDocker {
+    Off,
+    Sysbox { runtime: String },
+    Privileged,
+}
+
+impl InnerDocker {
+    /// Resolve the configured mode given the runtimes the host daemon reports.
+    fn resolve(
+        mode: DockerInSandboxMode,
+        sysbox_runtime: &str,
+        has_runtime: impl Fn(&str) -> bool,
+    ) -> Result<Self> {
+        let sysbox = || Self::Sysbox {
+            runtime: sysbox_runtime.to_string(),
+        };
+        match mode {
+            DockerInSandboxMode::Off => Ok(Self::Off),
+            DockerInSandboxMode::Privileged => Ok(Self::Privileged),
+            DockerInSandboxMode::Sysbox if has_runtime(sysbox_runtime) => Ok(sysbox()),
+            DockerInSandboxMode::Sysbox => Err(anyhow!(
+                "docker_in_sandbox.mode = \"sysbox\" but the Docker daemon has no \"{}\" runtime; \
+                 install sysbox (https://github.com/nestybox/sysbox) or change the mode",
+                sysbox_runtime
+            )),
+            DockerInSandboxMode::Auto if has_runtime(sysbox_runtime) => Ok(sysbox()),
+            DockerInSandboxMode::Auto => Ok(Self::Off),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Sysbox { .. } => "sysbox",
+            Self::Privileged => "privileged",
+        }
+    }
+}
+
+/// Name of the named volume holding a workspace's inner `/var/lib/docker`.
+fn inner_docker_volume_name(github_user: &str, project: &str) -> String {
+    format!("agentman-docker-{}-{}", github_user, project)
+}
 
 /// Ensure a host workspace directory exists and is writable by the container user, which
 /// appears on the host as `owner` (UID, GID).
@@ -129,6 +181,7 @@ pub struct ContainerManager {
     docker: Docker,
     config: Arc<GatewayConfig>,
     state: Arc<StateManager>,
+    inner_docker: InnerDocker,
 }
 
 impl ContainerManager {
@@ -145,10 +198,33 @@ impl ContainerManager {
 
         info!("Connected to Docker daemon");
 
+        let dind = &config.docker_in_sandbox;
+        let inner_docker = if dind.mode == DockerInSandboxMode::Off {
+            InnerDocker::Off
+        } else {
+            let runtimes = docker
+                .info()
+                .await
+                .context("Failed to query Docker daemon info")?
+                .runtimes
+                .unwrap_or_default();
+            InnerDocker::resolve(dind.mode, &dind.sysbox_runtime, |r| runtimes.contains_key(r))?
+        };
+        match &inner_docker {
+            InnerDocker::Off => info!("Docker inside sandboxes: off"),
+            InnerDocker::Sysbox { runtime } => {
+                info!("Docker inside sandboxes: sysbox (runtime {})", runtime)
+            }
+            InnerDocker::Privileged => {
+                warn!("Docker inside sandboxes: privileged (sandbox root is host root)")
+            }
+        }
+
         Ok(Self {
             docker,
             config,
             state,
+            inner_docker,
         })
     }
 
@@ -176,6 +252,7 @@ impl ContainerManager {
                 if self.container_exists(container_id).await? {
                     // Ensure it's running
                     self.ensure_running(container_id).await?;
+                    self.ensure_inner_dockerd(container_id).await;
                     return Ok(container_id.clone());
                 }
             }
@@ -210,6 +287,10 @@ impl ContainerManager {
 
         let labels: HashMap<String, String> = HashMap::from([
             ("agentman.managed".to_string(), "true".to_string()),
+            (
+                INNER_DOCKER_LABEL.to_string(),
+                self.inner_docker.label().to_string(),
+            ),
             ("agentman.github_user".to_string(), github_user.to_string()),
             ("agentman.project".to_string(), project.to_string()),
             (
@@ -219,7 +300,15 @@ impl ContainerManager {
         ]);
 
         // Build container configuration
-        let host_config = self.build_host_config(&workspace_path)?;
+        let data_volume = (self.inner_docker != InnerDocker::Off
+            && self.config.docker_in_sandbox.persist_data)
+            .then(|| inner_docker_volume_name(github_user, project));
+        let host_config = build_host_config(
+            &self.config,
+            &self.inner_docker,
+            &workspace_path,
+            data_volume.as_deref(),
+        )?;
         let env = self.build_env(github_user, project, &container_name);
 
         let config = ContainerCreateBody {
@@ -258,6 +347,8 @@ impl ContainerManager {
 
         info!("Started container {}", container_name);
 
+        self.ensure_inner_dockerd(&container_id).await;
+
         // Save workspace info
         let workspace_info = WorkspaceInfo {
             github_user: github_user.to_string(),
@@ -274,73 +365,6 @@ impl ContainerManager {
         Ok(container_id)
     }
 
-    /// Build the HostConfig with security settings and mounts.
-    fn build_host_config(&self, workspace_path: &Path) -> Result<HostConfig> {
-        let security = &self.config.container_security;
-
-        let mut host_config = HostConfig {
-            // Bind mount the workspace
-            binds: Some(vec![format!(
-                "{}:/workspace",
-                workspace_path.display()
-            )]),
-
-            // Add host.docker.internal for reverse port forwarding
-            extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
-
-            // Never run privileged
-            privileged: Some(false),
-
-            // No access to Docker socket
-            // (binds is already set, so docker.sock won't be mounted)
-
-            // Network settings
-            network_mode: Some("bridge".to_string()),
-
-            // Init process for proper signal handling
-            init: Some(true),
-
-            ..Default::default()
-        };
-
-        // Apply security settings
-        if security.cap_drop_all {
-            host_config.cap_drop = Some(vec!["ALL".to_string()]);
-            if !security.cap_add.is_empty() {
-                host_config.cap_add = Some(security.cap_add.clone());
-            }
-        }
-
-        if security.no_new_privileges {
-            host_config.security_opt = Some(vec!["no-new-privileges:true".to_string()]);
-        }
-
-        if security.readonly_rootfs {
-            host_config.readonly_rootfs = Some(true);
-            // Add tmpfs for common writable paths
-            host_config.tmpfs = Some(HashMap::from([
-                ("/tmp".to_string(), "rw,noexec,nosuid,size=1g".to_string()),
-                ("/run".to_string(), "rw,noexec,nosuid,size=64m".to_string()),
-                ("/var/tmp".to_string(), "rw,noexec,nosuid,size=256m".to_string()),
-            ]));
-        }
-
-        if let Some(ref memory) = security.memory_limit {
-            // Parse memory limit (e.g., "4g" -> bytes)
-            host_config.memory = Some(parse_memory_limit(memory)?);
-        }
-
-        if let Some(cpu) = security.cpu_limit {
-            // CPU quota in 100ns units (1 CPU = 100000)
-            host_config.nano_cpus = Some((cpu * 1_000_000_000.0) as i64);
-        }
-
-        // Use default seccomp profile (don't set to unconfined)
-        // The default Docker seccomp profile is already applied unless explicitly disabled
-
-        Ok(host_config)
-    }
-
     /// Build environment variables for the container.
     fn build_env(&self, github_user: &str, project: &str, container_name: &str) -> Vec<String> {
         vec![
@@ -349,6 +373,58 @@ impl ContainerManager {
             format!("AGENTMAN_CONTAINER_ID={}", container_name),
             "TERM=xterm-256color".to_string(),
         ]
+    }
+
+    /// Start the inner Docker daemon if this container was created with Docker-in-sandbox.
+    ///
+    /// Best-effort: a failure is logged and the session continues without Docker.
+    async fn ensure_inner_dockerd(&self, container_id: &str) {
+        let enabled = match self
+            .docker
+            .inspect_container(container_id, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(info) => info
+                .config
+                .and_then(|c| c.labels)
+                .and_then(|l| l.get(INNER_DOCKER_LABEL).cloned())
+                .is_some_and(|mode| mode != "off"),
+            Err(e) => {
+                warn!("Failed to inspect container {}: {}", container_id, e);
+                return;
+            }
+        };
+        if !enabled {
+            return;
+        }
+
+        let options = CreateExecOptions {
+            cmd: Some(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                start_dockerd_script(),
+            ]),
+            user: Some("root".to_string()),
+            ..Default::default()
+        };
+        let result = async {
+            let exec = self.docker.create_exec(container_id, options).await?;
+            self.docker
+                .start_exec(
+                    &exec.id,
+                    Some(StartExecOptions {
+                        detach: true,
+                        tty: false,
+                        output_capacity: None,
+                    }),
+                )
+                .await?;
+            Ok::<_, bollard::errors::Error>(())
+        }
+        .await;
+        if let Err(e) = result {
+            warn!("Failed to start dockerd in container {}: {}", container_id, e);
+        }
     }
 
     /// Ensure the container name is unique by adding a suffix if needed.
@@ -727,6 +803,27 @@ impl ContainerManager {
             }
         }
 
+        // Remove the inner Docker data volume along with the workspace data. It is looked up by
+        // name regardless of the current mode, so switching modes never strands a volume.
+        let mut removed_volumes = Vec::new();
+        if !opts.keep_workspace {
+            let volume = inner_docker_volume_name(github_user, project);
+            if opts.dry_run {
+                if self.docker.inspect_volume(&volume).await.is_ok() {
+                    removed_volumes.push(format!("{volume} (dry-run)"));
+                }
+            } else {
+                let rm_opts = RemoveVolumeOptionsBuilder::new().force(opts.force).build();
+                match self.docker.remove_volume(&volume, Some(rm_opts)).await {
+                    Ok(_) => removed_volumes.push(volume),
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404, ..
+                    }) => {}
+                    Err(e) => warnings.push(format!("remove volume {volume}: {e}")),
+                }
+            }
+        }
+
         // Delete persistent workspace directory.
         let mut workspace_deleted = false;
         if !opts.keep_workspace {
@@ -759,6 +856,7 @@ impl ContainerManager {
 
         Ok(DestroyResult {
             removed_containers,
+            removed_volumes,
             workspace_path,
             workspace_deleted,
             state_entry_deleted,
@@ -944,6 +1042,91 @@ async fn container_stats_fast(docker: &Docker, container_name: &str) -> Option<S
     })
 }
 
+/// Build the HostConfig with security settings and mounts.
+fn build_host_config(
+    config: &GatewayConfig,
+    inner_docker: &InnerDocker,
+    workspace_path: &Path,
+    data_volume: Option<&str>,
+) -> Result<HostConfig> {
+    let security = &config.container_security;
+
+    let mut host_config = HostConfig {
+        // Bind mount the workspace
+        binds: Some(vec![format!(
+            "{}:/workspace",
+            workspace_path.display()
+        )]),
+
+        // Add host.docker.internal for reverse port forwarding
+        extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
+
+        // Never run privileged unless Docker-in-sandbox explicitly asks for it
+        privileged: Some(*inner_docker == InnerDocker::Privileged),
+
+        // No access to Docker socket
+        // (binds is already set, so docker.sock won't be mounted)
+
+        // Network settings
+        network_mode: Some("bridge".to_string()),
+
+        // Init process for proper signal handling
+        init: Some(true),
+
+        ..Default::default()
+    };
+
+    if let Some(volume) = data_volume {
+        host_config
+            .binds
+            .get_or_insert_with(Vec::new)
+            .push(format!("{volume}:/var/lib/docker"));
+    }
+
+    match inner_docker {
+        InnerDocker::Off | InnerDocker::Privileged => {}
+        InnerDocker::Sysbox { runtime } => host_config.runtime = Some(runtime.clone()),
+    }
+
+    // Apply security settings. The inner dockerd needs the full capability set; under sysbox
+    // those capabilities are confined to the container's user namespace.
+    if security.cap_drop_all && *inner_docker == InnerDocker::Off {
+        host_config.cap_drop = Some(vec!["ALL".to_string()]);
+        if !security.cap_add.is_empty() {
+            host_config.cap_add = Some(security.cap_add.clone());
+        }
+    }
+
+    if security.no_new_privileges {
+        host_config.security_opt = Some(vec!["no-new-privileges:true".to_string()]);
+    }
+
+    if security.readonly_rootfs {
+        host_config.readonly_rootfs = Some(true);
+        // Add tmpfs for common writable paths
+        host_config.tmpfs = Some(HashMap::from([
+            ("/tmp".to_string(), "rw,noexec,nosuid,size=1g".to_string()),
+            ("/run".to_string(), "rw,noexec,nosuid,size=64m".to_string()),
+            ("/var/tmp".to_string(), "rw,noexec,nosuid,size=256m".to_string()),
+        ]));
+    }
+
+    if let Some(ref memory) = security.memory_limit {
+        // Parse memory limit (e.g., "4g" -> bytes)
+        host_config.memory = Some(parse_memory_limit(memory)?);
+    }
+
+    if let Some(cpu) = security.cpu_limit {
+        // CPU quota in 100ns units (1 CPU = 100000)
+        host_config.nano_cpus = Some((cpu * 1_000_000_000.0) as i64);
+    }
+
+    // Use default seccomp profile (don't set to unconfined)
+    // The default Docker seccomp profile is already applied unless explicitly disabled
+
+    Ok(host_config)
+}
+
 /// Parse a memory limit string (e.g., "4g", "512m") to bytes.
 pub fn parse_memory_limit(s: &str) -> Result<i64> {
     let s = s.trim().to_lowercase();
@@ -967,6 +1150,74 @@ pub fn parse_memory_limit(s: &str) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn host_config_for(inner_docker: &InnerDocker, data_volume: Option<&str>) -> HostConfig {
+        build_host_config(
+            &GatewayConfig::default(),
+            inner_docker,
+            Path::new("/ws"),
+            data_volume,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_resolve_inner_docker() {
+        let with_sysbox = |r: &str| r == "sysbox-runc";
+        let without = |_: &str| false;
+        let sysbox = InnerDocker::Sysbox {
+            runtime: "sysbox-runc".to_string(),
+        };
+
+        let resolve = |mode, has: &dyn Fn(&str) -> bool| {
+            InnerDocker::resolve(mode, "sysbox-runc", has)
+        };
+        assert_eq!(resolve(DockerInSandboxMode::Auto, &with_sysbox).unwrap(), sysbox);
+        assert_eq!(resolve(DockerInSandboxMode::Auto, &without).unwrap(), InnerDocker::Off);
+        assert_eq!(resolve(DockerInSandboxMode::Sysbox, &with_sysbox).unwrap(), sysbox);
+        assert!(resolve(DockerInSandboxMode::Sysbox, &without).is_err());
+        assert_eq!(
+            resolve(DockerInSandboxMode::Privileged, &without).unwrap(),
+            InnerDocker::Privileged
+        );
+        assert_eq!(resolve(DockerInSandboxMode::Off, &with_sysbox).unwrap(), InnerDocker::Off);
+    }
+
+    #[test]
+    fn test_host_config_without_inner_docker_is_locked_down() {
+        let hc = host_config_for(&InnerDocker::Off, None);
+        assert_eq!(hc.privileged, Some(false));
+        assert_eq!(hc.runtime, None);
+        assert_eq!(hc.cap_drop, Some(vec!["ALL".to_string()]));
+        assert_eq!(hc.binds, Some(vec!["/ws:/workspace".to_string()]));
+    }
+
+    #[test]
+    fn test_host_config_sysbox() {
+        let inner = InnerDocker::Sysbox {
+            runtime: "sysbox-runc".to_string(),
+        };
+        let hc = host_config_for(&inner, Some("agentman-docker-octocat-demo"));
+        assert_eq!(hc.privileged, Some(false));
+        assert_eq!(hc.runtime.as_deref(), Some("sysbox-runc"));
+        assert_eq!(hc.cap_drop, None);
+        assert_eq!(
+            hc.binds,
+            Some(vec![
+                "/ws:/workspace".to_string(),
+                "agentman-docker-octocat-demo:/var/lib/docker".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_host_config_privileged() {
+        let hc = host_config_for(&InnerDocker::Privileged, None);
+        assert_eq!(hc.privileged, Some(true));
+        assert_eq!(hc.runtime, None);
+        assert_eq!(hc.cap_drop, None);
+        assert_eq!(hc.binds, Some(vec!["/ws:/workspace".to_string()]));
+    }
 
     #[test]
     fn test_parse_memory_limit() {
