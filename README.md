@@ -1,6 +1,7 @@
 ## agentman
 
-Debian-based base image for a coding agent with pinned versions of:
+Debian-based base image for a coding agent with pinned versions of the tools below. Most are installed with [mise](https://mise.jdx.dev) (versions resolved via `https://mise-versions.jdx.dev`); Rust uses rustup, Python uses uv, and Java uses SDKMAN.
+- **herdr** (terminal workspace manager for coding agents; its headless server is the default command under `tini`)
 - **Rust** (via `rustup`) + pinned toolchain
 - **rust-analyzer** (via `rustup component add`, pinned to toolchain)
 - **Go**
@@ -9,11 +10,14 @@ Debian-based base image for a coding agent with pinned versions of:
 - **uv** + **Python** installed via `uv python install`
 - **Java** (via SDKMAN, pinned)
 - **DuckDB** (CLI)
-- **opencode** (default command under `tini`)
+- **opencode** v2 (default agent: opened in a herdr workspace in `/workspace` on start)
+- **Claude Code**, **pi** and **omp** (oh-my-pi) coding agents, with herdr integrations installed for all four
+- **cloudflared** (Cloudflare Tunnel client), **Caddy** and the GitHub CLI (`gh`)
+- CLI basics: `docker`, `git`, `jq`, `rg`, `fd`, `bat`, `eza`, `sqlite3`
 
 Python is installed using uv per the official guide: `https://docs.astral.sh/uv/guides/install-python/`.
 
-`opencode` refers to the OpenCode project: `https://github.com/anomalyco/opencode`.
+`herdr` refers to `https://github.com/herdrdev/herdr`; `opencode` refers to the OpenCode project: `https://github.com/anomalyco/opencode`.
 
 ## SSH Gateway
 
@@ -308,7 +312,7 @@ Note: `agentman exec <cmd>` is accepted as an alias (e.g. `agentman exec stats -
 
 Edit `docker-bake.hcl` (the `variable` defaults near the top), or override via environment variables:
 - **Base image**: `DEBIAN_TAG`
-- **Tools**: `RUSTUP_VERSION`, `RUST_TOOLCHAIN`, `GO_VERSION`, `BUN_VERSION`, `NODE_VERSION`, `UV_VERSION`, `PYTHON_VERSION`, `SDKMAN_VERSION`, `JAVA_VERSION`, `DUCKDB_VERSION`, `OPENCODE_VERSION`
+- **Tools**: `MISE_VERSION`, `HERDR_VERSION`, `RUSTUP_VERSION`, `RUST_TOOLCHAIN`, `GO_VERSION`, `BUN_VERSION`, `NODE_VERSION`, `UV_VERSION`, `PYTHON_VERSION`, `SDKMAN_VERSION`, `JAVA_VERSION`, `DUCKDB_VERSION`, `OPENCODE_VERSION`, `CLAUDE_CLI_VERSION`, `PI_VERSION`, `OMP_VERSION`, `CLOUDFLARED_VERSION`, `GH_VERSION`, `CADDY_VERSION`, `EZA_VERSION`, `BAT_VERSION`
 - **User**: `USERNAME`, `USER_UID`, `USER_GID`
 
 ### Build (local)
@@ -319,13 +323,21 @@ Requires Docker BuildKit + buildx.
 ./scripts/build.sh
 ```
 
-Run the image (defaults to running `opencode` under `tini`):
+Run the image (defaults to running `herdr server` under `tini`):
 
 ```bash
-docker run --rm -it agentman-base:dev
+docker run -d --name agentman agentman-base:dev
 ```
 
-To pass flags / arguments to opencode:
+On start, opencode is opened in a herdr workspace in `/workspace`. Pick another agent with `-e AGENTMAN_DEFAULT_AGENT=claude` (or `pi`, `omp`), or set it to an empty value to start with no agent.
+
+Attach to the herdr session (inside the container, or over SSH):
+
+```bash
+docker exec -it agentman herdr
+```
+
+Run a different command instead (for example opencode):
 
 ```bash
 docker run --rm -it agentman-base:dev opencode --help

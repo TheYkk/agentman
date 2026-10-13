@@ -40,5 +40,10 @@ if [ -f /etc/ssh/sshd_config ]; then
     sleep 1
 fi
 
+# When running the herdr server, open the default agent in it once it is up.
+if [ "$#" -eq 2 ] && [ "$1" = "herdr" ] && [ "$2" = "server" ]; then
+    /usr/local/bin/herdr-default-agent.sh &
+fi
+
 # Execute the original command
 exec "$@"

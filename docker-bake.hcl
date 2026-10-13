@@ -8,6 +8,8 @@ variable "IMAGE_TAG"     { default = "dev" }
 variable "PLATFORMS"     { default = "linux/amd64" }
 
 variable "DEBIAN_TAG"    { default = "trixie-slim" }
+variable "MISE_VERSION"     { default = "2026.10.9" }
+variable "HERDR_VERSION"    { default = "0.9.4" }
 variable "RUSTUP_VERSION"   { default = "1.29.1" }
 variable "RUST_TOOLCHAIN"   { default = "1.99.0" }
 variable "GO_VERSION"    { default = "1.27.2" }
@@ -18,7 +20,15 @@ variable "PYTHON_VERSION" { default = "3.13" }
 variable "SDKMAN_VERSION" { default = "5.23.2" }
 variable "JAVA_VERSION"   { default = "21.0.12-tem" }
 variable "DUCKDB_VERSION" { default = "1.5.6" }
-variable "OPENCODE_VERSION" { default = "v1.19.0" }
+variable "OPENCODE_VERSION" { default = "2.0.28" }
+variable "CLAUDE_CLI_VERSION"  { default = "2.1.296" }
+variable "PI_VERSION"       { default = "1.2.0" }
+variable "OMP_VERSION"      { default = "18.10.3" }
+variable "CLOUDFLARED_VERSION" { default = "2026.10.0" }
+variable "GH_VERSION"       { default = "2.102.0" }
+variable "CADDY_VERSION"    { default = "2.11.7" }
+variable "EZA_VERSION"      { default = "0.23.5" }
+variable "BAT_VERSION"      { default = "0.26.1" }
 
 variable "USERNAME"      { default = "agent" }
 variable "USER_UID"      { default = "1000" }
@@ -41,8 +51,13 @@ target "agentman" {
 
   platforms = [for p in split(",", PLATFORMS) : trimspace(p)]
 
+  // Optional: lets mise use an authenticated GitHub API when downloading releases.
+  secret = ["id=github_token,env=GITHUB_TOKEN"]
+
   args = {
     DEBIAN_TAG       = "${DEBIAN_TAG}"
+    MISE_VERSION     = "${MISE_VERSION}"
+    HERDR_VERSION    = "${HERDR_VERSION}"
     RUSTUP_VERSION   = "${RUSTUP_VERSION}"
     RUST_TOOLCHAIN   = "${RUST_TOOLCHAIN}"
     GO_VERSION       = "${GO_VERSION}"
@@ -54,6 +69,14 @@ target "agentman" {
     JAVA_VERSION     = "${JAVA_VERSION}"
     DUCKDB_VERSION   = "${DUCKDB_VERSION}"
     OPENCODE_VERSION = "${OPENCODE_VERSION}"
+    CLAUDE_CLI_VERSION = "${CLAUDE_CLI_VERSION}"
+    PI_VERSION       = "${PI_VERSION}"
+    OMP_VERSION      = "${OMP_VERSION}"
+    CLOUDFLARED_VERSION = "${CLOUDFLARED_VERSION}"
+    GH_VERSION       = "${GH_VERSION}"
+    CADDY_VERSION    = "${CADDY_VERSION}"
+    EZA_VERSION      = "${EZA_VERSION}"
+    BAT_VERSION      = "${BAT_VERSION}"
 
     USERNAME         = "${USERNAME}"
     USER_UID         = "${USER_UID}"

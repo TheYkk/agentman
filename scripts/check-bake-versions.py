@@ -19,6 +19,8 @@ import json
 import os
 import re
 import shlex
+import shutil
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -140,49 +142,6 @@ def _latest_rust_toolchain() -> str:
         return m.group(1)
 
 
-def _latest_go_version() -> str:
-    text = _http_get_text("https://go.dev/VERSION?m=text").strip()
-    # Example: "go1.25.5"
-    text = text.splitlines()[0].strip()
-    if not text.startswith("go"):
-        raise RuntimeError(f"Unexpected go VERSION response: {text!r}")
-    return text.removeprefix("go")
-
-
-def _latest_node_patch_for_major(major: int) -> str | None:
-    """
-    Return the latest Node.js patch release for a given major.
-
-    Uses the official dist index:
-      https://nodejs.org/dist/index.json
-    """
-    data = _http_get_json("https://nodejs.org/dist/index.json")
-    if not isinstance(data, list):
-        raise RuntimeError("Unexpected Node.js dist index JSON")
-
-    best_key: tuple[int, ...] | None = None
-    best: str | None = None
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        v = item.get("version")
-        if not isinstance(v, str):
-            continue
-        v = v.strip()
-        if not v.startswith("v"):
-            continue
-        num = v.removeprefix("v")
-        key = _parse_ints(num)
-        if key is None or not key:
-            continue
-        if key[0] != major:
-            continue
-        if best_key is None or key > best_key:
-            best_key = key
-            best = num
-    return best
-
-
 def _debian_stable_codename() -> str:
     rel = _http_get_text("https://deb.debian.org/debian/dists/stable/Release")
     m = re.search(r"(?m)^Codename:\s*(\S+)\s*$", rel)
@@ -280,6 +239,53 @@ def _check_debian_tag(current: str) -> Check:
         return Check("DEBIAN_TAG", current, None, "unknown", "deb.debian.org", str(e))
 
 
+def _mise_latest(tool: str) -> str:
+    """
+    Latest version of a tool as resolved by mise, which reads version lists from
+    https://mise-versions.jdx.dev (falling back to the tool's own source).
+    """
+    mise = shutil.which("mise")
+    if mise is None:
+        raise RuntimeError("mise is not installed")
+    out = subprocess.run(
+        [mise, "latest", tool],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    ).stdout.strip()
+    if not out:
+        raise RuntimeError(f"mise returned no version for {tool}")
+    return out.splitlines()[-1].strip()
+
+
+def _check_mise_version(*, name: str, current: str, tool: str, track_major: bool = False) -> Check:
+    """
+    tool is a mise tool name (e.g. "gh", "npm:@opencode/cli").
+    With track_major, only versions within the current major are considered (e.g. node@22).
+    """
+    query = tool
+    if track_major:
+        cur_key = _parse_ints(_strip_prefixes(current, ("v",)))
+        if cur_key:
+            query = f"{tool}@{cur_key[0]}"
+    source = f"mise:{query}"
+    try:
+        latest = _mise_latest(query)
+        cur_num = _parse_ints(_strip_prefixes(current, ("v",)))
+        latest_num = _parse_ints(_strip_prefixes(latest, ("v",)))
+        if cur_num is not None and latest_num is not None:
+            # mise may hold back very fresh releases; never report a downgrade as an update.
+            status: Status = "ok" if cur_num >= latest_num else "outdated"
+            if cur_num > latest_num:
+                latest = current
+        else:
+            status = "ok" if current == latest else "outdated"
+        return Check(name, current, latest, status, source)
+    except Exception as e:
+        return Check(name, current, None, "unknown", source, str(e))
+
+
 def _check_github_version(
     *,
     name: str,
@@ -314,38 +320,6 @@ def _check_github_version(
         return Check(name, current, latest, status, f"github:{owner}/{repo}")
     except Exception as e:
         return Check(name, current, None, "unknown", f"github:{owner}/{repo}", str(e))
-
-
-def _check_go_version(current: str) -> Check:
-    try:
-        latest = _latest_go_version()
-        cur_num = _parse_ints(current)
-        latest_num = _parse_ints(latest)
-        status: Status
-        if cur_num is not None and latest_num is not None:
-            status = "ok" if cur_num == latest_num else "outdated"
-        else:
-            status = "ok" if current == latest else "outdated"
-        return Check("GO_VERSION", current, latest, status, "go.dev")
-    except Exception as e:
-        return Check("GO_VERSION", current, None, "unknown", "go.dev", str(e))
-
-
-def _check_node_version(current: str) -> Check:
-    try:
-        cur_norm = _strip_prefixes(current, ("v",))
-        cur_key = _parse_ints(cur_norm)
-        if cur_key is None or not cur_key:
-            return Check("NODE_VERSION", current, None, "unknown", "nodejs.org", "unrecognized NODE_VERSION format")
-
-        latest = _latest_node_patch_for_major(cur_key[0])
-        if latest is None:
-            return Check("NODE_VERSION", current, None, "unknown", "nodejs.org", "could not find matching major releases")
-
-        status: Status = "ok" if cur_norm == latest else "outdated"
-        return Check("NODE_VERSION", current, latest, status, "nodejs.org")
-    except Exception as e:
-        return Check("NODE_VERSION", current, None, "unknown", "nodejs.org", str(e))
 
 
 def _check_rust_toolchain(current: str) -> Check:
@@ -431,23 +405,31 @@ def _checks_for(bake_vars: dict[str, str]) -> list[Check]:
         )
     )
     checks.append(_check_rust_toolchain(cur("RUST_TOOLCHAIN")))
-    checks.append(_check_go_version(cur("GO_VERSION")))
-    checks.append(
-        _check_github_version(
-            name="BUN_VERSION",
-            current=cur("BUN_VERSION"),
-            owner="oven-sh",
-            repo="bun",
-            strip=("bun-v", "v"),
-        )
-    )
-    checks.append(_check_node_version(cur("NODE_VERSION")))
-    checks.append(_check_github_version(name="UV_VERSION", current=cur("UV_VERSION"), owner="astral-sh", repo="uv", strip=("v",)))
     checks.append(_check_python_version(cur("PYTHON_VERSION")))
     checks.append(_check_github_version(name="SDKMAN_VERSION", current=cur("SDKMAN_VERSION"), owner="sdkman", repo="sdkman-cli", strip=("v",)))
     checks.append(_check_java_version(cur("JAVA_VERSION")))
-    checks.append(_check_github_version(name="DUCKDB_VERSION", current=cur("DUCKDB_VERSION"), owner="duckdb", repo="duckdb", strip=("v",)))
-    checks.append(_check_github_version(name="OPENCODE_VERSION", current=cur("OPENCODE_VERSION"), owner="anomalyco", repo="opencode"))
+    checks.append(_check_github_version(name="MISE_VERSION", current=cur("MISE_VERSION"), owner="jdx", repo="mise", strip=("v",)))
+
+    # Tools installed with mise.
+    mise_tools = [
+        ("HERDR_VERSION", "herdr", False),
+        ("CLOUDFLARED_VERSION", "cloudflared", False),
+        ("GH_VERSION", "gh", False),
+        ("CADDY_VERSION", "caddy", False),
+        ("DUCKDB_VERSION", "duckdb", False),
+        ("EZA_VERSION", "eza", False),
+        ("BAT_VERSION", "bat", False),
+        ("GO_VERSION", "go", False),
+        ("NODE_VERSION", "node", True),
+        ("BUN_VERSION", "bun", False),
+        ("UV_VERSION", "uv", False),
+        ("OPENCODE_VERSION", "npm:@opencode/cli", False),
+        ("CLAUDE_CLI_VERSION", "npm:@anthropic-ai/claude-code", False),
+        ("PI_VERSION", "npm:@earendil-works/pi-coding-agent", False),
+        ("OMP_VERSION", "npm:@oh-my-pi/pi-coding-agent", False),
+    ]
+    for name, tool, track_major in mise_tools:
+        checks.append(_check_mise_version(name=name, current=cur(name), tool=tool, track_major=track_major))
 
     return checks
 

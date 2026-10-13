@@ -63,14 +63,16 @@ If you need language drivers, install them using the repo conventions:
 
 Derived from `Dockerfile` + `docker-bake.hcl`:
 
-- **Pinned tools**:
-  - **Rust** via rustup (toolchain `1.92.0`)
-  - **Go** (`1.25.5`)
-  - **Bun** (`1.3.5`)
- - **Node.js** (pinned)
-  - **uv/uvx** (`0.9.22`) + **Python** installed via `uv python install` (default `3.13`)
-  - **DuckDB CLI** (`1.4.3`)
-  - **opencode** (`v1.1.7`) (default `CMD` under `tini`)
+- **Installed with mise** (global config in `~/.config/mise/config.toml`; add more with `mise use -g <tool>@<version>`):
+  - **herdr** (default `CMD` is `herdr server` under `tini`; attach with `herdr`)
+  - **opencode** v2 (default agent, opened in a herdr workspace on start)
+  - **Claude Code** (`claude`), **pi** (`pi`), **omp** (`omp`, oh-my-pi)
+  - **Go**, **Node.js**, **Bun**, **uv/uvx**
+  - **DuckDB CLI**, **cloudflared** (Cloudflare Tunnel client), **Caddy** (`caddy`), **GitHub CLI** (`gh`), `bat`, `eza`
+- **Other pinned tools**:
+  - **Rust** via rustup
+  - **Python** installed via `uv python install` (default `3.13`)
+  - **Java** via SDKMAN
 - **Database CLIs**:
   - `duckdb`, `psql` (postgresql-client), `mysql` (default-mysql-client), `sqlite3`
 - **Build tooling**:
