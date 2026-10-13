@@ -1235,6 +1235,17 @@ fn build_host_config(
         ]));
     }
 
+    // The inner dockerd and containerd keep pid files under /run. In the writable layer they
+    // survive a stop/start, and once the old pid is reused by another process the daemons refuse
+    // to start. A tmpfs /run is fresh on every start, as on a booted system.
+    if *inner_docker != InnerDocker::Off {
+        host_config
+            .tmpfs
+            .get_or_insert_with(HashMap::new)
+            .entry("/run".to_string())
+            .or_insert_with(|| "rw,nosuid,nodev,mode=755,size=64m".to_string());
+    }
+
     if let Some(ref memory) = security.memory_limit {
         // Parse memory limit (e.g., "4g" -> bytes)
         host_config.memory = Some(parse_memory_limit(memory)?);
@@ -1310,6 +1321,7 @@ mod tests {
     #[test]
     fn test_host_config_without_inner_docker_is_locked_down() {
         let hc = host_config_for(&InnerDocker::Off, None);
+        assert!(hc.tmpfs.is_none());
         assert_eq!(hc.privileged, Some(false));
         assert_eq!(hc.runtime, None);
         assert_eq!(hc.cap_drop, Some(vec!["ALL".to_string()]));
@@ -1337,6 +1349,7 @@ mod tests {
     #[test]
     fn test_host_config_privileged() {
         let hc = host_config_for(&InnerDocker::Privileged, None);
+        assert!(hc.tmpfs.as_ref().is_some_and(|t| t.contains_key("/run")));
         assert_eq!(hc.privileged, Some(true));
         assert_eq!(hc.runtime, None);
         assert_eq!(hc.cap_drop, None);

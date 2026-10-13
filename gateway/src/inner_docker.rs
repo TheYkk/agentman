@@ -18,8 +18,9 @@ pub const DOCKERD_READY_TIMEOUT_SECS: u32 = 20;
 /// keeps running in the background. Exits 1 if the daemon never became ready.
 ///
 /// The socket is owned by `socket_gid` (the sandbox user's group) so `docker` works without sudo.
-/// A restarted sandbox keeps its old pid file, which dockerd refuses to start over, so it is
-/// removed first.
+/// A restarted sandbox can keep the old dockerd and containerd pid files (when /run is not a
+/// tmpfs), which the daemons refuse to start over once the pid is reused, so they are removed
+/// first.
 pub fn start_dockerd_command(socket_gid: u32) -> Vec<String> {
     let tries = DOCKERD_READY_TIMEOUT_SECS * 4;
     vec![
@@ -27,7 +28,7 @@ pub fn start_dockerd_command(socket_gid: u32) -> Vec<String> {
         "-c".to_string(),
         format!(
             "if ! pgrep -x dockerd >/dev/null 2>&1; then \
-               rm -f /var/run/docker.pid; \
+               rm -f /var/run/docker.pid /var/run/docker/containerd/containerd.pid; \
                nohup dockerd --group {socket_gid} >{DOCKERD_LOG} 2>&1 </dev/null & \
              fi; \
              i=0; \
@@ -55,5 +56,6 @@ mod tests {
         assert!(cmd[2].starts_with("if ! pgrep -x dockerd >/dev/null 2>&1; then"));
         assert!(cmd[2].contains("dockerd --group 1000 >/var/log/dockerd.log"));
         assert!(cmd[2].contains("docker version"));
+        assert!(cmd[2].contains("rm -f /var/run/docker.pid /var/run/docker/containerd/containerd.pid;"));
     }
 }
