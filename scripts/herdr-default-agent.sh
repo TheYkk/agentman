@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Opens a herdr workspace in /workspace running the default agent once the herdr server is up.
+# Makes sure the herdr session has the default agent running once the server is up.
 # Started in the background by docker-entrypoint.sh when the container runs `herdr server`.
+# After a restart herdr restores the layout as plain shell panes, so this also restarts the
+# agent in the restored focused pane.
 
 agent="${AGENTMAN_DEFAULT_AGENT:-}"
 [ -n "$agent" ] || exit 0
@@ -20,14 +22,18 @@ for _ in $(seq 1 60); do
     sleep 0.5
 done
 
-# Leave existing workspaces alone (e.g. a layout restored from a previous run).
-if herdr workspace list 2>/dev/null | jq -e '.result.workspaces | length > 0' >/dev/null; then
+# Leave the session alone if any pane already runs an agent.
+if herdr agent list 2>/dev/null | jq -e '[.result.agents[]? | select(.agent != null)] | length > 0' >/dev/null; then
     exit 0
 fi
 
-pane_id="$(herdr workspace create --cwd /workspace --label "$agent" --focus | jq -r '.result.root_pane.pane_id')"
-if [ -z "$pane_id" ] || [ "$pane_id" = "null" ]; then
-    echo "herdr-default-agent: failed to create workspace" >&2
+# Reuse the focused pane of a restored workspace, or create a workspace in /workspace.
+pane_id="$(herdr pane list 2>/dev/null | jq -r '(.result.panes // []) | ((map(select(.focused)) + .)[0].pane_id) // empty')"
+if [ -z "$pane_id" ]; then
+    pane_id="$(herdr workspace create --cwd /workspace --label "$agent" --focus | jq -r '.result.root_pane.pane_id // empty')"
+fi
+if [ -z "$pane_id" ]; then
+    echo "herdr-default-agent: no pane to start $agent in" >&2
     exit 1
 fi
 
