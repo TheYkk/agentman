@@ -7,6 +7,7 @@
 mod config;
 mod docker;
 mod gateway_control;
+mod inner_docker;
 mod github;
 mod proxmox;
 mod pty;

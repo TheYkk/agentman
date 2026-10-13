@@ -105,7 +105,8 @@ ip = "dhcp"
 # pool = "agentman"
 
 unprivileged = true
-# nesting + keyctl let Docker run inside unprivileged containers; fuse is optional.
+# nesting (systemd, Docker) and keyctl (Docker; only set when docker_in_sandbox.mode != "off").
+# fuse is optional.
 nesting = true
 keyctl = true
 fuse = false
@@ -135,20 +136,29 @@ pct_path = "/usr/sbin/pct"
 
 [docker_in_sandbox]
 # Give each sandbox its own Docker daemon so `docker build` / `docker run` work inside it.
-#   "auto"       - use sysbox when the host Docker daemon has the sysbox runtime, otherwise off (default)
-#   "sysbox"     - always use sysbox; the gateway refuses to start if the runtime is missing
-#   "privileged" - run sandboxes with --privileged; sandbox root is host root, trusted users only
-#   "off"        - no Docker inside sandboxes
-# Sysbox (https://github.com/nestybox/sysbox) runs the sandbox in a user namespace, so the inner
-# dockerd gets the capabilities it needs without host root. The container_security cap_drop/cap_add
-# settings are not applied while Docker-in-sandbox is on.
+# This section is shared by all sandbox backends.
+#   "auto" - enable only where it is isolated without extra privileges (default):
+#            Docker backend: when the host Docker daemon has the sysbox runtime
+#            LXC backend: unprivileged containers with nesting
+#   "on"   - always enable; the Docker backend uses docker_isolation below and the gateway
+#            refuses to start if that isolation is unavailable
+#   "off"  - no Docker inside sandboxes
+# The gateway starts dockerd as root inside the sandbox on create and on every reconnect
+# (log: /var/log/dockerd.log); the socket belongs to the sandbox user's group.
 # A mode change applies to newly created sandboxes; destroy and reconnect to switch an existing one.
 mode = "auto"
 
-# Runtime name sysbox is registered under in /etc/docker/daemon.json
+# Docker backend only: isolation used when mode = "on".
+#   "sysbox"     - sysbox runtime (https://github.com/nestybox/sysbox): the sandbox runs in a user
+#                  namespace, so the inner dockerd gets its capabilities without host root
+#   "privileged" - --privileged; sandbox root is host root, trusted users only
+# The container_security cap_drop/cap_add settings are not applied while Docker-in-sandbox is on.
+docker_isolation = "sysbox"
+
+# Docker backend only: runtime name sysbox is registered under in /etc/docker/daemon.json
 sysbox_runtime = "sysbox-runc"
 
-# Keep inner images, build cache and volumes in a per-workspace named volume
+# Docker backend only: keep inner images, build cache and volumes in a per-workspace named volume
 # (agentman-docker-<github_user>-<project>) so they survive container recreation.
 # The volume is deleted with the workspace on destroy.
 persist_data = true

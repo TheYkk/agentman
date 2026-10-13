@@ -28,9 +28,10 @@ use tracing::{debug, info, warn};
 
 use crate::config::{DockerInSandboxMode, GatewayConfig, ProxmoxConfig, RuntimeKind};
 use crate::docker::{ensure_workspace_writable, parse_memory_limit};
+use crate::inner_docker::start_dockerd_command;
 use crate::pty::{make_controlling_terminal, open_pty, PtyReader, PtyWriter};
 use crate::runtime::{
-    start_dockerd_script, DestroyOptions, DestroyResult, ExecOutput, ExecProcess, ExecSpec, Resizer, SandboxStats,
+    DestroyOptions, DestroyResult, ExecOutput, ExecProcess, ExecSpec, Resizer, SandboxStats,
     SandboxStatus,
 };
 use crate::state::{StateManager, WorkspaceInfo};
@@ -312,13 +313,16 @@ fn lxc_attach_args(cfg: &ProxmoxConfig, vmid: &str, env: &[String], cmd: &[Strin
     args
 }
 
-/// Create a directory (if needed) owned by `owner` on the host.
-async fn ensure_dir_owned(path: &Path, owner: (u32, u32)) -> Result<()> {
-    tokio::fs::create_dir_all(path)
-        .await
-        .with_context(|| format!("Failed to create {}", path.display()))?;
-    std::os::unix::fs::chown(path, Some(owner.0), Some(owner.1))
-        .with_context(|| format!("Failed to chown {}", path.display()))
+/// Whether sandboxes run their own Docker daemon on this backend.
+///
+/// `auto` enables it when the container can isolate it without extra privileges: unprivileged
+/// with nesting (keyctl is then turned on too).
+fn inner_docker_enabled(mode: DockerInSandboxMode, cfg: &ProxmoxConfig) -> bool {
+    match mode {
+        DockerInSandboxMode::Off => false,
+        DockerInSandboxMode::On => true,
+        DockerInSandboxMode::Auto => cfg.unprivileged && cfg.nesting,
+    }
 }
 
 /// Read a stream of byte chunks from an async reader.
@@ -441,9 +445,7 @@ impl ProxmoxManager {
             );
         }
 
-        // nesting + keyctl already let unprivileged LXC containers run Docker, so every mode
-        // except `off` simply turns the inner daemon on (sysbox/privileged are Docker-runtime terms).
-        let inner_docker = config.docker_in_sandbox.mode != DockerInSandboxMode::Off;
+        let inner_docker = inner_docker_enabled(config.docker_in_sandbox.mode, pcfg);
         if inner_docker && !(pcfg.nesting && (pcfg.keyctl || !pcfg.unprivileged)) {
             warn!("Docker inside sandboxes is on, but proxmox.nesting/keyctl are off; dockerd will likely fail");
         }
@@ -657,7 +659,7 @@ impl ProxmoxManager {
             ("onboot", "0".to_string()),
             ("start", "0".to_string()),
         ];
-        if let Some(features) = pcfg.features() {
+        if let Some(features) = pcfg.features(self.inner_docker) {
             params.push(("features", features));
         }
         if let Some(cpu) = security.cpu_limit {
@@ -724,15 +726,10 @@ impl ProxmoxManager {
         // Bind mount the persistent workspace. Proxmox only lets root@pam add bind mounts,
         // so this goes through `pct` on the node rather than the API token.
         let mp0 = format!("{},mp={}", workspace_path.display(), WORKSPACE_MOUNT);
-        let mut pct_args = vec!["set".to_string(), vmid.clone(), "--mp0".to_string(), mp0];
-        if let Some(data) = self.docker_data_path(github_user, project) {
-            // Keep the inner /var/lib/docker (images, build cache, volumes) across container recreation.
-            ensure_dir_owned(&data, self.pcfg().host_root_owner()).await?;
-            pct_args.push("--mp1".to_string());
-            pct_args.push(format!("{},mp=/var/lib/docker", data.display()));
-        }
-        let pct_args: Vec<&str> = pct_args.iter().map(String::as_str).collect();
-        if let Err(e) = self.run_tool(&self.pcfg().pct_path, &pct_args).await {
+        if let Err(e) = self
+            .run_tool(&self.pcfg().pct_path, &["set", &vmid, "--mp0", &mp0])
+            .await
+        {
             warn!("Removing container {} after failed setup", vmid);
             if let Err(e2) = self.delete_ct(&vmid).await {
                 warn!("Cleanup of container {} failed: {:#}", vmid, e2);
@@ -770,20 +767,15 @@ impl ProxmoxManager {
         Ok(vmid)
     }
 
-    /// Host directory persisted as the container's `/var/lib/docker`, when enabled.
-    fn docker_data_path(&self, github_user: &str, project: &str) -> Option<PathBuf> {
-        (self.inner_docker && self.config.docker_in_sandbox.persist_data)
-            .then(|| self.config.docker_data_path(github_user, project))
-    }
-
     /// Start the inner Docker daemon (as container root). Idempotent and best-effort: a failure
     /// is logged and the session continues without Docker.
     async fn ensure_inner_dockerd(&self, vmid: &str) {
-        let script = start_dockerd_script();
+        // Socket group = the exec user's group inside the container, so `docker` works without sudo.
         let run = Command::new(self.lxc_tool("lxc-attach"))
             .args(["-n", vmid, "--clear-env", "--set-var"])
             .arg("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-            .args(["--", "/bin/sh", "-c", &script])
+            .arg("--")
+            .args(start_dockerd_command(self.pcfg().exec_gid))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -1050,21 +1042,8 @@ impl ProxmoxManager {
             workspace_deleted = true;
         }
 
-        // Delete the persisted inner Docker data along with the workspace data. Looked up by path
-        // regardless of the current mode, so switching modes never strands it.
-        let mut removed_volumes = Vec::new();
-        let docker_data = self.config.docker_data_path(github_user, project);
-        if !opts.keep_workspace && docker_data.exists() {
-            let label = docker_data.display().to_string();
-            if opts.dry_run {
-                removed_volumes.push(format!("{label} (dry-run)"));
-            } else {
-                match tokio::fs::remove_dir_all(&docker_data).await {
-                    Ok(()) => removed_volumes.push(label),
-                    Err(e) => warnings.push(format!("remove docker data {label}: {e}")),
-                }
-            }
-        }
+        // Inner Docker data lives in the container's root filesystem and went with it.
+        let removed_volumes = Vec::new();
 
         // Remove the workspace entry from state.
         let state_entry_deleted = if opts.dry_run {
@@ -1165,15 +1144,28 @@ mod tests {
 
     #[test]
     fn features_allow_docker_inside() {
-        assert_eq!(
-            ProxmoxConfig::default().features().as_deref(),
-            Some("nesting=1,keyctl=1")
-        );
+        let cfg = ProxmoxConfig::default();
+        assert_eq!(cfg.features(true).as_deref(), Some("nesting=1,keyctl=1"));
+        assert_eq!(cfg.features(false).as_deref(), Some("nesting=1"));
         let privileged = ProxmoxConfig {
             unprivileged: false,
             ..ProxmoxConfig::default()
         };
-        assert_eq!(privileged.features().as_deref(), Some("nesting=1"));
+        assert_eq!(privileged.features(true).as_deref(), Some("nesting=1"));
+    }
+
+    #[test]
+    fn docker_in_sandbox_mode_maps_to_lxc() {
+        let cfg = ProxmoxConfig::default();
+        assert!(inner_docker_enabled(DockerInSandboxMode::Auto, &cfg));
+        assert!(inner_docker_enabled(DockerInSandboxMode::On, &cfg));
+        assert!(!inner_docker_enabled(DockerInSandboxMode::Off, &cfg));
+        let privileged = ProxmoxConfig {
+            unprivileged: false,
+            ..ProxmoxConfig::default()
+        };
+        assert!(!inner_docker_enabled(DockerInSandboxMode::Auto, &privileged));
+        assert!(inner_docker_enabled(DockerInSandboxMode::On, &privileged));
     }
 
     #[test]

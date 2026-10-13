@@ -19,22 +19,6 @@ use crate::proxmox::ProxmoxManager;
 use crate::pty::PtyMaster;
 use crate::state::WorkspaceInfo;
 
-/// GID of the sandbox user baked into the base image (see Dockerfile: USER_GID).
-pub const SANDBOX_USER_GID: u32 = 1000;
-
-/// Starts dockerd inside the sandbox unless it is already running. Run as root in the sandbox.
-///
-/// A restarted container keeps its old pid file, which dockerd refuses to start over, so it is
-/// removed first. The socket is owned by the sandbox user's group so `docker` works without sudo.
-/// Shared by the Docker and Proxmox LXC runtimes.
-pub fn start_dockerd_script() -> String {
-    format!(
-        "pgrep -x dockerd >/dev/null 2>&1 && exit 0; \
-         rm -f /var/run/docker.pid; \
-         nohup dockerd --group {SANDBOX_USER_GID} >/var/log/dockerd.log 2>&1 &"
-    )
-}
-
 /// Options for destroying a workspace (container(s) + persistent data).
 #[derive(Debug, Clone, Copy)]
 pub struct DestroyOptions {

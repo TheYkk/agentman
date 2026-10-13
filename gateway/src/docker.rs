@@ -29,9 +29,10 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{info, warn};
 
-use crate::config::{DockerInSandboxMode, GatewayConfig, RuntimeKind};
+use crate::config::{DockerInSandboxMode, DockerIsolation, GatewayConfig, RuntimeKind};
+use crate::inner_docker;
 use crate::runtime::{
-    start_dockerd_script, DestroyOptions, DestroyResult, ExecOutput, ExecProcess, ExecSpec, Resizer, SandboxStats,
+    DestroyOptions, DestroyResult, ExecOutput, ExecProcess, ExecSpec, Resizer, SandboxStats,
     SandboxStatus,
 };
 use crate::state::{StateManager, WorkspaceInfo};
@@ -52,23 +53,28 @@ impl InnerDocker {
     /// Resolve the configured mode given the runtimes the host daemon reports.
     fn resolve(
         mode: DockerInSandboxMode,
+        isolation: DockerIsolation,
         sysbox_runtime: &str,
         has_runtime: impl Fn(&str) -> bool,
     ) -> Result<Self> {
         let sysbox = || Self::Sysbox {
             runtime: sysbox_runtime.to_string(),
         };
-        match mode {
-            DockerInSandboxMode::Off => Ok(Self::Off),
-            DockerInSandboxMode::Privileged => Ok(Self::Privileged),
-            DockerInSandboxMode::Sysbox if has_runtime(sysbox_runtime) => Ok(sysbox()),
-            DockerInSandboxMode::Sysbox => Err(anyhow!(
-                "docker_in_sandbox.mode = \"sysbox\" but the Docker daemon has no \"{}\" runtime; \
-                 install sysbox (https://github.com/nestybox/sysbox) or change the mode",
+        match (mode, isolation) {
+            (DockerInSandboxMode::Off, _) => Ok(Self::Off),
+            // `auto` never escalates to privileged; it only uses sysbox when it is installed.
+            (DockerInSandboxMode::Auto, _) if has_runtime(sysbox_runtime) => Ok(sysbox()),
+            (DockerInSandboxMode::Auto, _) => Ok(Self::Off),
+            (DockerInSandboxMode::On, DockerIsolation::Privileged) => Ok(Self::Privileged),
+            (DockerInSandboxMode::On, DockerIsolation::Sysbox) if has_runtime(sysbox_runtime) => {
+                Ok(sysbox())
+            }
+            (DockerInSandboxMode::On, DockerIsolation::Sysbox) => Err(anyhow!(
+                "docker_in_sandbox.mode = \"on\" with docker_isolation = \"sysbox\", but the Docker \
+                 daemon has no \"{}\" runtime; install sysbox (https://github.com/nestybox/sysbox), \
+                 set docker_isolation = \"privileged\", or set mode = \"off\"",
                 sysbox_runtime
             )),
-            DockerInSandboxMode::Auto if has_runtime(sysbox_runtime) => Ok(sysbox()),
-            DockerInSandboxMode::Auto => Ok(Self::Off),
         }
     }
 
@@ -208,7 +214,9 @@ impl ContainerManager {
                 .context("Failed to query Docker daemon info")?
                 .runtimes
                 .unwrap_or_default();
-            InnerDocker::resolve(dind.mode, &dind.sysbox_runtime, |r| runtimes.contains_key(r))?
+            InnerDocker::resolve(dind.mode, dind.docker_isolation, &dind.sysbox_runtime, |r| {
+                runtimes.contains_key(r)
+            })?
         };
         match &inner_docker {
             InnerDocker::Off => info!("Docker inside sandboxes: off"),
@@ -399,11 +407,7 @@ impl ContainerManager {
         }
 
         let options = CreateExecOptions {
-            cmd: Some(vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                start_dockerd_script(),
-            ]),
+            cmd: Some(inner_docker::start_dockerd_command(self.config.workspace_owner().1)),
             user: Some("root".to_string()),
             ..Default::default()
         };
@@ -1169,18 +1173,18 @@ mod tests {
             runtime: "sysbox-runc".to_string(),
         };
 
-        let resolve = |mode, has: &dyn Fn(&str) -> bool| {
-            InnerDocker::resolve(mode, "sysbox-runc", has)
+        use DockerInSandboxMode::{Auto, Off, On};
+        use DockerIsolation::{Privileged, Sysbox};
+        let resolve = |mode, isolation, has: &dyn Fn(&str) -> bool| {
+            InnerDocker::resolve(mode, isolation, "sysbox-runc", has)
         };
-        assert_eq!(resolve(DockerInSandboxMode::Auto, &with_sysbox).unwrap(), sysbox);
-        assert_eq!(resolve(DockerInSandboxMode::Auto, &without).unwrap(), InnerDocker::Off);
-        assert_eq!(resolve(DockerInSandboxMode::Sysbox, &with_sysbox).unwrap(), sysbox);
-        assert!(resolve(DockerInSandboxMode::Sysbox, &without).is_err());
-        assert_eq!(
-            resolve(DockerInSandboxMode::Privileged, &without).unwrap(),
-            InnerDocker::Privileged
-        );
-        assert_eq!(resolve(DockerInSandboxMode::Off, &with_sysbox).unwrap(), InnerDocker::Off);
+        assert_eq!(resolve(Auto, Sysbox, &with_sysbox).unwrap(), sysbox);
+        assert_eq!(resolve(Auto, Sysbox, &without).unwrap(), InnerDocker::Off);
+        assert_eq!(resolve(Auto, Privileged, &without).unwrap(), InnerDocker::Off);
+        assert_eq!(resolve(On, Sysbox, &with_sysbox).unwrap(), sysbox);
+        assert!(resolve(On, Sysbox, &without).is_err());
+        assert_eq!(resolve(On, Privileged, &without).unwrap(), InnerDocker::Privileged);
+        assert_eq!(resolve(Off, Sysbox, &with_sysbox).unwrap(), InnerDocker::Off);
     }
 
     #[test]

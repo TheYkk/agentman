@@ -224,7 +224,7 @@ How it works:
 - Lifecycle (create, start, shutdown, destroy, status, stats) goes through the **Proxmox VE API** with an API token.
 - The workspace is bind-mounted at `/workspace` with `pct set <vmid> --mp0 ...` (Proxmox only lets `root@pam` add bind mounts, which API tokens cannot do).
 - Shells and commands are attached with `lxc-attach` and drop to UID/GID 1000 (`exec_uid`/`exec_gid`) with `setpriv --init-groups`, so the user keeps groups like `docker`. Interactive sessions get a real PTY and follow window resizes.
-- Containers are created with `features: nesting=1,keyctl=1`, which is what Docker needs to run inside an unprivileged LXC container (set `fuse = true` too if you use fuse-overlayfs).
+- Docker inside the sandbox follows `[docker_in_sandbox] mode`: unless it is `off` (and by default, since LXC containers are unprivileged with nesting), containers get `features: nesting=1,keyctl=1` and the gateway starts `dockerd` as container root with `lxc-attach` on create and on every reconnect. Inner Docker data lives in the container's root filesystem, so it survives reconnects and restarts and is removed with `agentman destroy`.
 - `agentman pause` freezes the container with `lxc-freeze`; reconnecting unfreezes it.
 - Containers are unprivileged by default, so the gateway chowns workspaces to the shifted host UID (`id_map_offset + exec_uid`, i.e. `101000`).
 
@@ -260,22 +260,23 @@ Limitations: `ssh -R` listeners bind on the Proxmox host, and there is no `host.
 
 ### Docker Inside Sandboxes
 
-Each sandbox can run its own Docker daemon, so agents can `docker build`, `docker run` and `docker compose up` without touching the host's Docker socket.
-
-The recommended setup is [sysbox](https://github.com/nestybox/sysbox): install it on the gateway host (it registers a `sysbox-runc` runtime with Docker) and the gateway picks it up automatically. Sysbox runs the sandbox in a user namespace, so the inner `dockerd` has the capabilities it needs while root in the sandbox stays unprivileged on the host.
+Each sandbox can run its own Docker daemon, so agents can `docker build`, `docker run` and `docker compose up` without touching the host's Docker socket. One `[docker_in_sandbox]` section controls this for every sandbox backend:
 
 ```toml
 [docker_in_sandbox]
-mode = "auto"              # auto | sysbox | privileged | off
-sysbox_runtime = "sysbox-runc"
-persist_data = true        # keep inner images/build cache across container recreation
+mode = "auto"                  # auto | on | off
+docker_isolation = "sysbox"    # Docker backend only: sysbox | privileged
+sysbox_runtime = "sysbox-runc" # Docker backend only
+persist_data = true            # Docker backend only: keep inner images across container recreation
 ```
 
-- `auto` (default) uses sysbox when the runtime is present and otherwise leaves Docker off, so existing hosts keep their current behavior.
-- `sysbox` requires the runtime; the gateway refuses to start without it.
-- `privileged` runs sandboxes with `--privileged` for hosts that cannot install sysbox. Root in such a sandbox is root on the host, so only use it for fully trusted users.
+- `auto` (default) enables it only where it needs no extra privileges, and otherwise leaves sandboxes as they are. On the Docker backend that means the host has [sysbox](https://github.com/nestybox/sysbox) installed (it registers a `sysbox-runc` runtime); sysbox runs the sandbox in a user namespace, so the inner `dockerd` gets the capabilities it needs while sandbox root stays unprivileged on the host.
+- `on` always enables it. On the Docker backend it uses `docker_isolation`: `sysbox` makes the gateway refuse to start without the runtime, and `privileged` runs sandboxes with `--privileged` for hosts that cannot install sysbox. Root in a privileged sandbox is root on the host, so only use it for fully trusted users.
+- `off` disables it.
 
-When enabled, the gateway starts `dockerd` as root inside the sandbox whenever the container is created or reconnected to (logs in `/var/log/dockerd.log`), with the socket owned by the `agent` user's group so `docker` works without `sudo`. Inner Docker data lives in a named volume `agentman-docker-<github_user>-<project>`, which `agentman destroy` deletes together with the workspace (`--keep-workspace` keeps both). The mode is recorded on each container, so a change only applies to sandboxes created afterwards; destroy a sandbox (with `--keep-workspace`) to switch it.
+When enabled, the gateway starts `dockerd` as root inside the sandbox whenever it is created or reconnected to (logs in `/var/log/dockerd.log`), with the socket owned by the `agent` user's group so `docker` works without `sudo`. Nothing extra is needed in the image beyond the `docker.io` package it already ships.
+
+On the Docker backend, inner Docker data lives in a named volume `agentman-docker-<github_user>-<project>`, which `agentman destroy` deletes together with the workspace (`--keep-workspace` keeps both). The mode is recorded on each container, so a change only applies to sandboxes created afterwards; destroy a sandbox (with `--keep-workspace`) to switch it.
 
 ### Container Naming
 
