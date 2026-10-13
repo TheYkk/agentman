@@ -8,6 +8,7 @@ variable "IMAGE_TAG"     { default = "dev" }
 variable "PLATFORMS"     { default = "linux/amd64" }
 
 variable "DEBIAN_TAG"    { default = "trixie-slim" }
+variable "HERDR_VERSION"    { default = "v0.9.4" }
 variable "RUSTUP_VERSION"   { default = "1.29.1" }
 variable "RUST_TOOLCHAIN"   { default = "1.99.0" }
 variable "GO_VERSION"    { default = "1.27.2" }
@@ -43,6 +44,7 @@ target "agentman" {
 
   args = {
     DEBIAN_TAG       = "${DEBIAN_TAG}"
+    HERDR_VERSION    = "${HERDR_VERSION}"
     RUSTUP_VERSION   = "${RUSTUP_VERSION}"
     RUST_TOOLCHAIN   = "${RUST_TOOLCHAIN}"
     GO_VERSION       = "${GO_VERSION}"

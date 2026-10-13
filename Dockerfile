@@ -8,6 +8,7 @@ FROM debian:${DEBIAN_TAG}
 ARG DEBIAN_TAG
 
 # Tool versions (override at build time)
+ARG HERDR_VERSION=v0.9.4
 ARG RUSTUP_VERSION=1.27.1
 ARG RUST_TOOLCHAIN=1.92.0
 ARG GO_VERSION=1.25.5
@@ -95,6 +96,20 @@ RUN apt-get update \
       apt-get install -y --no-install-recommends bsdextrautils; \
     fi \
  && rm -rf /var/lib/apt/lists/*
+
+# --- herdr (pinned) ---
+# Terminal workspace manager for coding agents; runs as the container's main process (see CMD).
+# https://github.com/herdrdev/herdr
+RUN arch="$(dpkg --print-architecture)" \
+ && case "${arch}" in \
+      amd64) herdr_arch="x86_64" ;; \
+      arm64) herdr_arch="aarch64" ;; \
+      *) echo "Unsupported dpkg architecture: ${arch}" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL -o /tmp/herdr "https://github.com/herdrdev/herdr/releases/download/${HERDR_VERSION}/herdr-linux-${herdr_arch}" \
+ && install -m 0755 /tmp/herdr /usr/local/bin/herdr \
+ && rm -f /tmp/herdr \
+ && herdr --version
 
 # --- DuckDB CLI (pinned) ---
 RUN arch="$(dpkg --print-architecture)" \
@@ -295,6 +310,6 @@ USER ${USERNAME}
 # Set tini as entrypoint for proper signal handling.
 # Use custom entrypoint that sets up SSH
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
-# CMD ["opencode"]
 
-CMD ["sleep", "infinity"]
+# herdr's headless server is the container's main process; attach with `herdr` (e.g. over SSH).
+CMD ["herdr", "server"]

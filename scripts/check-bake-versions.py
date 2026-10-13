@@ -448,6 +448,7 @@ def _checks_for(bake_vars: dict[str, str]) -> list[Check]:
     checks.append(_check_java_version(cur("JAVA_VERSION")))
     checks.append(_check_github_version(name="DUCKDB_VERSION", current=cur("DUCKDB_VERSION"), owner="duckdb", repo="duckdb", strip=("v",)))
     checks.append(_check_github_version(name="OPENCODE_VERSION", current=cur("OPENCODE_VERSION"), owner="anomalyco", repo="opencode"))
+    checks.append(_check_github_version(name="HERDR_VERSION", current=cur("HERDR_VERSION"), owner="herdrdev", repo="herdr"))
 
     return checks
 

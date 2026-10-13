@@ -10,7 +10,7 @@ help:
 	@echo "    make build       - build image locally (single-platform, uses --load)"
 	@echo "    make push        - build and push image (supports multi-platform)"
 	@echo "    make build-nc    - build image without cache"
-	@echo "    make run         - run opencode (default entrypoint)"
+	@echo "    make run         - run the herdr server (default command)"
 	@echo "    make shell       - start an interactive shell (override entrypoint)"
 	@echo ""
 	@echo "  Gateway:"
@@ -24,7 +24,7 @@ vars:
 	@echo "BAKE_FILE=$$(realpath docker-bake.hcl 2>/dev/null || echo docker-bake.hcl)"; \
 	python3 scripts/check-bake-versions.py --print-vars --only \
 	  IMAGE_NAME IMAGE_TAG PLATFORMS \
-	  DEBIAN_TAG \
+	  DEBIAN_TAG HERDR_VERSION \
 	  RUSTUP_VERSION RUST_TOOLCHAIN GO_VERSION BUN_VERSION UV_VERSION PYTHON_VERSION \
 	  SDKMAN_VERSION JAVA_VERSION \
 	  DUCKDB_VERSION OPENCODE_VERSION \
