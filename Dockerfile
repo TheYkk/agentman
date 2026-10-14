@@ -96,6 +96,8 @@ RUN apt-get update \
       xz-utils \
       zip \
       docker.io \
+      docker-cli \
+      docker-compose \
       postgresql-client \
       default-mysql-client \
       python3 \
@@ -142,6 +144,7 @@ RUN mkdir -p /var/run/sshd \
 RUN groupadd --gid "${USER_GID}" "${USERNAME}" \
  && useradd --uid "${USER_UID}" --gid "${USER_GID}" --create-home --shell /bin/bash "${USERNAME}" \
  && usermod -aG sudo "${USERNAME}" \
+ && usermod -aG docker "${USERNAME}" \
  && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" >"/etc/sudoers.d/${USERNAME}" \
  && chmod 0440 "/etc/sudoers.d/${USERNAME}" \
  && mkdir -p /workspace \
@@ -150,6 +153,18 @@ RUN groupadd --gid "${USER_GID}" "${USERNAME}" \
  && chmod 700 /home/${USERNAME}/.ssh \
  && chown -R "${USERNAME}:${USERNAME}" /home/${USERNAME}/.ssh
 
+# Login shells (e.g. `bash -l` in tmux) reset PATH in /etc/profile; add the tool dirs back.
+# Tool locations are pinned via ENV below, so they do not depend on $HOME
+# (the gateway sets HOME=/workspace for non-PTY SSH commands).
+RUN printf '%s\n' \
+      '# agentman: tool paths (mise shims, cargo, go, sdkman)' \
+      'for p in /home/${USERNAME}/.sdkman/candidates/java/current/bin /home/${USERNAME}/go/bin /home/${USERNAME}/.local/share/mise/shims /home/${USERNAME}/.local/bin /home/${USERNAME}/.cargo/bin; do' \
+      '  case ":${PATH}:" in *":${p}:"*) ;; *) PATH="${p}:${PATH}" ;; esac' \
+      'done' \
+      'export PATH' \
+    | sed "s|\${USERNAME}|${USERNAME}|g" >/etc/profile.d/agentman-path.sh \
+ && chmod 0644 /etc/profile.d/agentman-path.sh
+
 USER ${USERNAME}
 WORKDIR /workspace
 ENV HOME=/home/${USERNAME} \
@@ -157,6 +172,12 @@ ENV HOME=/home/${USERNAME} \
     SDKMAN_DIR=/home/${USERNAME}/.sdkman \
     JAVA_HOME=/home/${USERNAME}/.sdkman/candidates/java/current \
     MISE_YES=1 \
+    MISE_DATA_DIR=/home/${USERNAME}/.local/share/mise \
+    MISE_CONFIG_DIR=/home/${USERNAME}/.config/mise \
+    MISE_CACHE_DIR=/home/${USERNAME}/.cache/mise \
+    MISE_STATE_DIR=/home/${USERNAME}/.local/state/mise \
+    RUSTUP_HOME=/home/${USERNAME}/.rustup \
+    CARGO_HOME=/home/${USERNAME}/.cargo \
     PATH=/home/${USERNAME}/.cargo/bin:/home/${USERNAME}/.local/bin:/home/${USERNAME}/.local/share/mise/shims:/home/${USERNAME}/go/bin:/home/${USERNAME}/.sdkman/candidates/java/current/bin:${PATH}
 
 # --- Tools via mise (pinned) ---
