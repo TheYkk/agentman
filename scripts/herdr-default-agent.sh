@@ -14,9 +14,17 @@ if ! command -v "$agent" >/dev/null 2>&1; then
     exit 0
 fi
 
-# Wait for the herdr server socket.
+# Wait for the herdr server. `herdr status server` exits 0 even when it is not running,
+# so read its output.
+herdr_up() {
+    case "$(herdr status server 2>/dev/null)" in
+        *"not running"*) return 1 ;;
+        *running*) return 0 ;;
+    esac
+    return 1
+}
 for _ in $(seq 1 60); do
-    if herdr status server >/dev/null 2>&1; then
+    if herdr_up; then
         break
     fi
     sleep 0.5
@@ -27,8 +35,10 @@ if herdr agent list 2>/dev/null | jq -e '[.result.agents[]? | select(.agent != n
     exit 0
 fi
 
-# Reuse the focused pane of a restored workspace, or create a workspace in /workspace.
-pane_id="$(herdr pane list 2>/dev/null | jq -r '(.result.panes // []) | ((map(select(.focused)) + .)[0].pane_id) // empty')"
+# Reuse a pane of a restored workspace in /workspace (the focused one first), or create a
+# workspace in /workspace. Panes elsewhere, like the default "~" workspace herdr makes for a
+# client that attached first, are left alone.
+pane_id="$(herdr pane list 2>/dev/null | jq -r '(.result.panes // []) | map(select((.cwd // "/workspace") | startswith("/workspace"))) | ((map(select(.focused)) + .)[0].pane_id) // empty')"
 if [ -z "$pane_id" ]; then
     pane_id="$(herdr workspace create --cwd /workspace --label "$agent" --focus | jq -r '.result.root_pane.pane_id // empty')"
 fi

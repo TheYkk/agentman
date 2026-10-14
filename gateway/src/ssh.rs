@@ -620,24 +620,7 @@ impl Handler for ConnectionHandler {
             .as_ref()
             .map(|a| a.ssh_auth_sock_in_container());
 
-        let cmd = match self.server.config.shell.mode {
-            ShellMode::Bash => vec!["/bin/bash".to_string(), "-l".to_string()],
-            ShellMode::Tmux => {
-                // Only start tmux when the client requested a PTY (true interactive session).
-                // This avoids breaking editor/bootstrap flows that use non-PTY sessions.
-                if tty {
-                    let session_name =
-                        sanitize_tmux_session_name(&self.server.config.shell.tmux_session);
-                    let script = format!(
-                        "if command -v tmux >/dev/null 2>&1; then exec tmux new-session -A -s '{session}' -c /workspace /bin/bash -l; else exec /bin/bash -l; fi",
-                        session = session_name
-                    );
-                    vec!["/bin/bash".to_string(), "-lc".to_string(), script]
-                } else {
-                    vec!["/bin/bash".to_string(), "-l".to_string()]
-                }
-            }
-        };
+        let cmd = interactive_shell_cmd(self.server.config.shell.mode, tty);
 
         let spec = ExecSpec {
             cmd,
@@ -944,7 +927,7 @@ impl Handler for ConnectionHandler {
             }
         }
 
-        // Prefer a stable SSH_AUTH_SOCK path via symlink, so long-lived sessions (e.g. tmux) can
+        // Prefer a stable SSH_AUTH_SOCK path via symlink, so long-lived sessions (e.g. herdr) can
         // keep using the same env var across reconnects. If symlinks aren't available, fall back
         // to exposing the unique socket path directly.
         let (symlink_host_path, symlink_filename) =
@@ -1543,19 +1526,60 @@ fn is_localhost(host: &str) -> bool {
         || host == "0.0.0.0"
 }
 
-fn sanitize_tmux_session_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for c in name.chars() {
-        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-            out.push(c);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        "agentman".to_string()
-    } else {
-        out
+/// Script that attaches an interactive session to the sandbox's herdr server.
+///
+/// herdr's server is the image's main process (`herdr server`), started by the container
+/// itself. Right after a sandbox is created it may not be listening yet, so wait for it. Never
+/// run the client before the server is up: the client would start a server of its own, and
+/// the container's real one (which opens the default agent) would then fail to start.
+/// `herdr status server` exits 0 either way, so readiness is read from its output. If the
+/// server does not come up within 30s, or herdr is missing, fall back to a login shell.
+const HERDR_ATTACH_SCRIPT: &str = r#"if command -v herdr >/dev/null 2>&1; then
+  herdr_up() {
+    case "$(herdr status server 2>/dev/null)" in
+      *"not running"*) return 1 ;;
+      *running*) return 0 ;;
+    esac
+    return 1
+  }
+  i=0
+  until herdr_up; do
+    i=$((i + 1))
+    [ "$i" -ge "${AGENTMAN_HERDR_WAIT_TICKS:-150}" ] && break
+    [ "$i" -eq 5 ] && echo "Waiting for herdr to start..." >&2
+    sleep 0.2
+  done
+  if herdr_up; then
+    # On a fresh sandbox, give the image's default-agent script a moment to open its
+    # /workspace workspace first; a client attaching to an empty server gets a default
+    # workspace of its own instead.
+    if command -v jq >/dev/null 2>&1; then
+      i=0
+      until herdr pane list 2>/dev/null | jq -e '(.result.panes // []) | length > 0' >/dev/null 2>&1; do
+        i=$((i + 1))
+        [ "$i" -ge "${AGENTMAN_HERDR_WAIT_TICKS:-75}" ] && break
+        sleep 0.2
+      done
+    fi
+    cd /workspace 2>/dev/null
+    exec herdr
+  fi
+  echo "herdr is not running in this sandbox; starting a plain shell." >&2
+fi
+exec /bin/bash -l"#;
+
+/// Command for a `shell` request.
+///
+/// Only PTY sessions (a real interactive terminal) attach to herdr. Non-PTY shells, as used by
+/// editor bootstrap flows, get a plain login shell so their stdin/stdout stay a byte stream.
+fn interactive_shell_cmd(mode: ShellMode, tty: bool) -> Vec<String> {
+    match mode {
+        ShellMode::Herdr if tty => vec![
+            "/bin/bash".to_string(),
+            "-lc".to_string(),
+            HERDR_ATTACH_SCRIPT.to_string(),
+        ],
+        ShellMode::Herdr | ShellMode::Bash => vec!["/bin/bash".to_string(), "-l".to_string()],
     }
 }
 
@@ -1714,5 +1738,133 @@ mod tests {
         );
         assert_eq!(rx.recv().await.unwrap(), "agentman: starting sandbox agent...\r\n");
         assert!(rx.recv().await.is_none());
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn pty_shell_attaches_to_herdr() {
+        let cmd = interactive_shell_cmd(ShellMode::Herdr, true);
+        assert_eq!(cmd[..2], ["/bin/bash", "-lc"]);
+        assert!(cmd[2].contains("exec herdr\n"));
+        assert!(cmd[2].contains("exec /bin/bash -l"));
+        assert!(!cmd[2].contains("tmux"));
+    }
+
+    #[test]
+    fn non_pty_shell_is_plain_login_shell() {
+        assert_eq!(interactive_shell_cmd(ShellMode::Herdr, false), ["/bin/bash", "-l"]);
+        assert_eq!(interactive_shell_cmd(ShellMode::Bash, true), ["/bin/bash", "-l"]);
+        assert_eq!(interactive_shell_cmd(ShellMode::Bash, false), ["/bin/bash", "-l"]);
+    }
+
+    /// Runs the attach script with `bin` prepended to PATH and returns its stdout.
+    fn run_attach_script(bin: &std::path::Path) -> String {
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        // Keep the "never comes up" cases fast; the real waits are 30s and 15s.
+        let out = Command::new("/bin/bash")
+            .arg("-c")
+            .arg(HERDR_ATTACH_SCRIPT)
+            .env_clear()
+            .env("PATH", path)
+            .env("AGENTMAN_HERDR_WAIT_TICKS", "10")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// Fresh empty directory for one test, removed on drop.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("agentman-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_script(dir: &std::path::Path, name: &str, body: &str) {
+        let p = dir.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Fake `herdr`. `status server` reports "not running" (exit 0, like the real one) until
+    /// probe `ready_after`, then "running". `pane list` is empty until call `panes_after`.
+    /// Bare `herdr` is the client attach and reports how many of each call it saw.
+    fn fake_herdr(dir: &std::path::Path, ready_after: u32, panes_after: u32) {
+        let d = dir.display();
+        write_script(
+            dir,
+            "herdr",
+            &format!(
+                r#"count() {{ n=$(cat {d}/$1 2>/dev/null || echo 0); n=$((n+1)); echo $n > {d}/$1; }}
+case "$1" in
+status)
+  count status
+  if [ "$n" -ge {ready_after} ]; then echo "status: running"; else echo "status: not running"; fi
+  exit 0 ;;
+pane)
+  count panes
+  if [ "$n" -ge {panes_after} ]; then echo '{{"result":{{"panes":[{{"pane_id":"p1"}}]}}}}'
+  else echo '{{"result":{{"panes":[]}}}}'; fi
+  exit 0 ;;
+esac
+echo "attached args=[$*] status=$(cat {d}/status) panes=$(cat {d}/panes)""#
+            ),
+        );
+    }
+
+    #[test]
+    fn attach_script_waits_for_server_and_workspace_then_execs_herdr() {
+        let dir = TempDir::new("herdr-attach");
+        fake_herdr(dir.path(), 3, 2);
+        // Status probes 1 and 2 say "not running", 3 says running, one more confirms. Then
+        // the first pane list is empty and the second has the default agent's workspace.
+        assert_eq!(
+            run_attach_script(dir.path()),
+            "attached args=[] status=4 panes=2\n"
+        );
+    }
+
+    #[test]
+    fn attach_script_attaches_without_workspace_after_timeout() {
+        let dir = TempDir::new("herdr-no-workspace");
+        fake_herdr(dir.path(), 1, u32::MAX);
+        // No default agent ever opens a workspace: attach anyway once the wait runs out.
+        assert_eq!(
+            run_attach_script(dir.path()),
+            "attached args=[] status=2 panes=10\n"
+        );
+    }
+
+    #[test]
+    fn attach_script_never_starts_client_without_server() {
+        let dir = TempDir::new("herdr-never-up");
+        fake_herdr(dir.path(), u32::MAX, 1);
+        // The server never comes up: give a shell (reading empty stdin), not the client.
+        assert_eq!(run_attach_script(dir.path()), "");
+    }
+
+    #[test]
+    fn attach_script_falls_back_to_bash_without_herdr() {
+        let dir = TempDir::new("herdr-fallback");
+        // No herdr on PATH: the script must still give a shell (here reading empty stdin).
+        let out = run_attach_script(dir.path());
+        assert_eq!(out, "");
     }
 }

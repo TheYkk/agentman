@@ -5,41 +5,27 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Interactive shell/session configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShellConfig {
     /// How interactive shells are started.
     pub mode: ShellMode,
-
-    /// Tmux session name to attach/create when `mode = "tmux"`.
-    ///
-    /// The session lives inside each agent container and enables reconnect/resume.
-    pub tmux_session: String,
-}
-
-impl Default for ShellConfig {
-    fn default() -> Self {
-        Self {
-            mode: ShellMode::Tmux,
-            tmux_session: "agentman".to_string(),
-        }
-    }
 }
 
 /// How to start an interactive shell when the user connects.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ShellMode {
+    /// Attach to the sandbox's herdr server (the image's main process), falling back to a
+    /// login shell when herdr is not installed.
+    ///
+    /// `"tmux"` is accepted as an alias so configs from before herdr keep working (and land
+    /// in herdr); the old `tmux_session` key is ignored.
+    #[default]
+    #[serde(alias = "tmux")]
+    Herdr,
     /// Start a plain login shell (`bash -l`).
     Bash,
-    /// Attach to (or create) a persistent tmux session.
-    Tmux,
-}
-
-impl Default for ShellMode {
-    fn default() -> Self {
-        Self::Tmux
-    }
 }
 
 /// OpenSSH agent forwarding configuration.
@@ -603,5 +589,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.docker_in_sandbox.docker_isolation, DockerIsolation::Privileged);
+    }
+
+    #[test]
+    fn shell_mode_defaults_to_herdr() {
+        let config: GatewayConfig = toml::from_str("").unwrap();
+        assert_eq!(config.shell.mode, ShellMode::Herdr);
+    }
+
+    #[test]
+    fn shell_mode_parses_modes_and_legacy_tmux() {
+        for (raw, mode) in [
+            ("herdr", ShellMode::Herdr),
+            ("bash", ShellMode::Bash),
+            ("tmux", ShellMode::Herdr),
+        ] {
+            let config: GatewayConfig =
+                toml::from_str(&format!("[shell]\nmode = \"{raw}\"\n")).unwrap();
+            assert_eq!(config.shell.mode, mode);
+        }
+
+        // Configs written for the tmux mode still load.
+        let config: GatewayConfig =
+            toml::from_str("[shell]\nmode = \"tmux\"\ntmux_session = \"agentman\"\n").unwrap();
+        assert_eq!(config.shell.mode, ShellMode::Herdr);
     }
 }
