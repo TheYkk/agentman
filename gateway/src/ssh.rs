@@ -15,7 +15,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use futures::StreamExt;
-use russh::server::{Auth, Handler, Msg, Session};
+use russh::server::{Auth, Handle, Handler, Msg, Session};
 use russh::{Channel, ChannelId, CryptoVec, MethodKind, MethodSet};
 use russh::keys::PublicKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -34,6 +34,7 @@ use crate::github::{
     validate_github_username, validate_project_name, GitHubKeyFetcher,
 };
 use crate::runtime::{ExecOutput, ExecSpec, Resizer, Runtime};
+use crate::runtime;
 use crate::state::{KeyCacheEntry, StateManager};
 
 /// Shared state for the SSH server.
@@ -58,8 +59,9 @@ pub struct ConnectionHandler {
     /// Project name (parsed from SSH username).
     project: Option<String>,
 
-    /// Container ID (after provisioning).
-    container_id: Option<String>,
+    /// Container ID (after provisioning). Shared with session tasks that provision in the
+    /// background.
+    container_id: Arc<std::sync::Mutex<Option<String>>>,
 
     /// Active exec sessions (channel_id -> exec session).
     exec_sessions: HashMap<ChannelId, ExecSession>,
@@ -85,12 +87,66 @@ pub struct ConnectionHandler {
 }
 
 struct ExecSession {
-    resizer: Resizer,
+    resizer: Arc<PendingResizer>,
     tty: bool,
     /// Channel for sending data to the container.
     stdin_tx: Option<mpsc::Sender<Vec<u8>>>,
     /// Task bridging the process I/O to the SSH channel.
     io_task: tokio::task::AbortHandle,
+}
+
+/// The TTY resizer of an exec session whose process may still be starting (the sandbox can
+/// take a while to create). Resizes that arrive before then are remembered and applied once
+/// the process exists.
+#[derive(Default)]
+struct PendingResizer(std::sync::Mutex<ResizeState>);
+
+enum ResizeState {
+    /// The process has not started; holds the latest requested size.
+    Pending(Option<(u16, u16)>),
+    Ready(Resizer),
+}
+
+impl Default for ResizeState {
+    fn default() -> Self {
+        Self::Pending(None)
+    }
+}
+
+impl PendingResizer {
+    /// Returns the resizer to use now, or remembers the size if the process has not started.
+    fn resize_or_remember(&self, cols: u16, rows: u16) -> Option<Resizer> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match &mut *state {
+            ResizeState::Pending(size) => {
+                *size = Some((cols, rows));
+                None
+            }
+            ResizeState::Ready(resizer) => Some(resizer.clone()),
+        }
+    }
+
+    /// Installs the process resizer. Returns a size requested while the process was starting.
+    fn set_ready(&self, resizer: Resizer) -> Option<(u16, u16)> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match std::mem::replace(&mut *state, ResizeState::Ready(resizer)) {
+            ResizeState::Pending(size) => size,
+            ResizeState::Ready(_) => None,
+        }
+    }
+}
+
+/// Which sandbox an exec session runs in.
+enum SandboxTarget {
+    /// An already provisioned sandbox, by id.
+    Ready(String),
+    /// Get or create the workspace sandbox first, writing progress to the channel's stderr.
+    Provision { github_user: String, project: String },
+}
+
+/// A status line for the client's stderr. A PTY is in raw mode, so it needs CRLF.
+fn status_line(msg: &str, tty: bool) -> String {
+    format!("{msg}{}", if tty { "\r\n" } else { "\n" })
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +163,11 @@ enum ChannelStreamKind {
     /// TCP forwarding channels (direct-tcpip / forwarded-tcpip): treat as raw byte streams.
     TcpForward,
 }
+
+/// Shown when the SSH key is not yet linked to a GitHub user. Clients that cannot prompt
+/// (BatchMode, scripts) need the `project+githubuser@host` form instead.
+const KBD_INTERACTIVE_INSTRUCTIONS: &str = "Enter your GitHub username to verify your SSH key \
+     (or connect as project+githubuser@host to skip this prompt):";
 
 static NEXT_AGENT_FWD_ID: AtomicU64 = AtomicU64::new(1);
 const AGENT_FWD_SYMLINK_NAME: &str = ".agentman-ssh-agent.sock";
@@ -208,7 +269,7 @@ impl ConnectionHandler {
             peer_addr,
             github_user: None,
             project: None,
-            container_id: None,
+            container_id: Arc::default(),
             exec_sessions: HashMap::new(),
             watch_sessions: HashMap::new(),
             pending_github_user: None,
@@ -406,7 +467,7 @@ impl Handler for ConnectionHandler {
                 // Initial request - ask for GitHub username
                 Ok(Auth::Partial {
                     name: "GitHub Username".into(),
-                    instructions: "Enter your GitHub username to verify your SSH key:".into(),
+                    instructions: KBD_INTERACTIVE_INSTRUCTIONS.into(),
                     prompts: vec![("GitHub username: ".into(), true)].into(),
                 })
             }
@@ -544,21 +605,10 @@ impl Handler for ConnectionHandler {
             .as_ref()
             .ok_or_else(|| anyhow!("No project specified"))?;
 
-        // Get or create container
-        let container_id = match self
-            .server
-            .runtime
-            .get_or_create_sandbox(github_user, project)
-            .await
-        {
-            Ok(id) => id,
-            Err(e) => {
-                report_provisioning_error(channel_id, session, github_user, project, &e)?;
-                return Ok(());
-            }
+        let target = SandboxTarget::Provision {
+            github_user: github_user.clone(),
+            project: project.clone(),
         };
-
-        self.container_id = Some(container_id.clone());
 
         let (tty, term) = match self.ptys.get(&channel_id) {
             Some(pty) => (true, pty.term.as_str()),
@@ -596,18 +646,10 @@ impl Handler for ConnectionHandler {
             size: self.pty_size(channel_id),
         };
 
-        // Start the process in the container and connect it to the channel
-        self.start_exec_session(
-            channel_id,
-            &container_id,
-            spec,
-            ChannelStreamKind::Session,
-            session,
-        )
-            .await?;
-
-        // Confirm the shell request was accepted (client may be waiting on this).
+        // Confirm the shell request was accepted (client may be waiting on this), then get the
+        // sandbox and start the shell in the background so progress reaches the client.
         session.channel_success(channel_id)?;
+        self.start_exec_session(channel_id, target, spec, ChannelStreamKind::Session, session);
 
         Ok(())
     }
@@ -738,21 +780,10 @@ impl Handler for ConnectionHandler {
             }
         }
 
-        // Get or create container
-        let container_id = match self
-            .server
-            .runtime
-            .get_or_create_sandbox(github_user, project)
-            .await
-        {
-            Ok(id) => id,
-            Err(e) => {
-                report_provisioning_error(channel_id, session, github_user, project, &e)?;
-                return Ok(());
-            }
+        let target = SandboxTarget::Provision {
+            github_user: github_user.clone(),
+            project: project.clone(),
         };
-
-        self.container_id = Some(container_id.clone());
 
         let (tty, term) = match self.ptys.get(&channel_id) {
             Some(pty) => (true, pty.term.as_str()),
@@ -773,18 +804,10 @@ impl Handler for ConnectionHandler {
             size: self.pty_size(channel_id),
         };
 
-        // Start the process in the container and connect it to the channel
-        self.start_exec_session(
-            channel_id,
-            &container_id,
-            spec,
-            ChannelStreamKind::Session,
-            session,
-        )
-            .await?;
-
-        // Confirm the exec request was accepted (OpenSSH sets want-reply=true).
+        // Confirm the exec request was accepted (OpenSSH sets want-reply=true), then get the
+        // sandbox and start the command in the background so progress reaches the client.
         session.channel_success(channel_id)?;
+        self.start_exec_session(channel_id, target, spec, ChannelStreamKind::Session, session);
 
         Ok(())
     }
@@ -813,10 +836,10 @@ impl Handler for ConnectionHandler {
             if !exec_session.tty {
                 return Ok(());
             }
-            if let Err(e) = exec_session
+            if let Some(resizer) = exec_session
                 .resizer
-                .resize(col_width as u16, row_height as u16)
-                .await
+                .resize_or_remember(col_width as u16, row_height as u16)
+                && let Err(e) = resizer.resize(col_width as u16, row_height as u16).await
             {
                 warn!("Failed to resize exec: {}", e);
             }
@@ -1077,13 +1100,18 @@ impl Handler for ConnectionHandler {
             .as_ref()
             .ok_or_else(|| anyhow!("No project specified"))?;
 
-        let container_id = match self.container_id.clone() {
+        let cached = self
+            .container_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let container_id = match cached {
             Some(id) => id,
             None => {
                 let id = match self
                     .server
                     .runtime
-                    .get_or_create_sandbox(github_user, project)
+                    .get_or_create_sandbox(github_user, project, &runtime::no_progress)
                     .await
                 {
                     Ok(id) => id,
@@ -1095,7 +1123,7 @@ impl Handler for ConnectionHandler {
                         return Ok(false);
                     }
                 };
-                self.container_id = Some(id.clone());
+                *self.container_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.clone());
                 id
             }
         };
@@ -1130,12 +1158,11 @@ impl Handler for ConnectionHandler {
         // Treat direct-tcpip as a raw byte stream: no exit-status and no SSH stderr extended-data.
         self.start_exec_session(
             channel.id(),
-            &container_id,
+            SandboxTarget::Ready(container_id),
             spec,
             ChannelStreamKind::TcpForward,
             session,
-        )
-        .await?;
+        );
 
         Ok(true)
     }
@@ -1304,19 +1331,22 @@ impl ConnectionHandler {
     }
 
     /// Start a process in the sandbox and connect it to an SSH channel.
-    async fn start_exec_session(
+    ///
+    /// Runs in a background task: the SSH session only flushes output between handler calls,
+    /// so a sandbox created inside the handler would leave the client staring at nothing.
+    fn start_exec_session(
         &mut self,
         channel_id: ChannelId,
-        sandbox_id: &str,
+        target: SandboxTarget,
         spec: ExecSpec,
         kind: ChannelStreamKind,
         session: &mut Session,
-    ) -> Result<()> {
+    ) {
         let tty = spec.tty;
-        let process = self.server.runtime.exec(sandbox_id, spec).await?;
-        let mut output = process.output;
-        let mut input = process.input;
-        let exit_status = process.exit_status;
+        let runtime = self.server.runtime.clone();
+        let container_cache = self.container_id.clone();
+        let resizer = Arc::new(PendingResizer::default());
+        let task_resizer = resizer.clone();
 
         // Create channel for stdin
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(32);
@@ -1326,6 +1356,53 @@ impl ConnectionHandler {
 
         // Spawn task to handle the exec I/O
         let io_task = tokio::spawn(async move {
+            let sandbox_id = match target {
+                SandboxTarget::Ready(id) => id,
+                SandboxTarget::Provision {
+                    github_user,
+                    project,
+                } => {
+                    match provision_with_progress(&runtime, &handle, channel_id, &github_user, &project, tty)
+                        .await
+                    {
+                        Ok(id) => {
+                            *container_cache.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(id.clone());
+                            id
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to provision sandbox for {}/{}: {:#}",
+                                github_user, project, e
+                            );
+                            let msg = format!("agentman: failed to start sandbox {project}: {e:#}");
+                            fail_channel(&handle, channel_id, kind, &status_line(&msg, true)).await;
+                            return;
+                        }
+                    }
+                }
+            };
+
+            let process = match runtime.exec(&sandbox_id, spec).await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("Failed to start process in sandbox {}: {:#}", sandbox_id, e);
+                    let msg = format!("agentman: failed to start process: {e:#}");
+                    fail_channel(&handle, channel_id, kind, &status_line(&msg, true)).await;
+                    return;
+                }
+            };
+            let mut output = process.output;
+            let mut input = process.input;
+            let exit_status = process.exit_status;
+            // Apply a resize that arrived while the sandbox was being prepared.
+            let pending_size = task_resizer.set_ready(process.resizer.clone());
+            if let (true, Some((cols, rows))) = (tty, pending_size)
+                && let Err(e) = process.resizer.resize(cols, rows).await
+            {
+                warn!("Failed to resize exec: {}", e);
+            }
+
             // Task to forward stdin to container
             let stdin_task = async move {
                 while let Some(data) = stdin_rx.recv().await {
@@ -1402,38 +1479,59 @@ impl ConnectionHandler {
         self.exec_sessions.insert(
             channel_id,
             ExecSession {
-                resizer: process.resizer,
+                resizer,
                 tty,
                 stdin_tx: Some(stdin_tx),
                 io_task: io_task.abort_handle(),
             },
         );
-
-        Ok(())
     }
 }
 
-/// Tell the client why its sandbox could not be provisioned, instead of dropping the channel.
-///
-/// Accepts the shell/exec request, writes the full error chain to stderr, and exits with 1.
-fn report_provisioning_error(
+/// Get or create the workspace sandbox, writing the runtime's progress lines (creating,
+/// starting, ...) to the channel's stderr as they happen. Stderr keeps stdout clean for
+/// non-PTY exec sessions that use it as a transport (editor bootstraps, scp, ...).
+async fn provision_with_progress(
+    runtime: &Runtime,
+    handle: &Handle,
     channel_id: ChannelId,
-    session: &mut Session,
     github_user: &str,
     project: &str,
-    err: &anyhow::Error,
-) -> Result<()> {
-    warn!(
-        "Failed to provision sandbox for {}/{}: {:#}",
-        github_user, project, err
-    );
-    let msg = format!("agentman: failed to start sandbox {project}: {err:#}\r\n");
-    session.channel_success(channel_id)?;
-    session.extended_data(channel_id, 1, CryptoVec::from_slice(msg.as_bytes()))?;
-    session.exit_status_request(channel_id, 1)?;
-    session.eof(channel_id)?;
-    session.close(channel_id)?;
-    Ok(())
+    tty: bool,
+) -> Result<String> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let writer = handle.clone();
+    let forward = tokio::spawn(async move {
+        while let Some(line) = rx.recv().await {
+            let _ = writer
+                .extended_data(channel_id, 1, CryptoVec::from_slice(line.as_bytes()))
+                .await;
+        }
+    });
+    let progress = move |msg: &str| {
+        let _ = tx.send(status_line(msg, tty));
+    };
+    let res = runtime
+        .get_or_create_sandbox(github_user, project, &progress)
+        .await;
+    // Flush every progress line before the process output starts.
+    drop(progress);
+    let _ = forward.await;
+    res
+}
+
+/// Tell the client why its session could not start, instead of dropping the channel.
+///
+/// Writes the message to stderr (session channels only) and exits with 1.
+async fn fail_channel(handle: &Handle, channel_id: ChannelId, kind: ChannelStreamKind, msg: &str) {
+    if kind == ChannelStreamKind::Session {
+        let _ = handle
+            .extended_data(channel_id, 1, CryptoVec::from_slice(msg.as_bytes()))
+            .await;
+        let _ = handle.exit_status_request(channel_id, 1).await;
+    }
+    let _ = handle.eof(channel_id).await;
+    let _ = handle.close(channel_id).await;
 }
 
 /// Check if a hostname refers to localhost.
@@ -1551,5 +1649,70 @@ async fn load_or_generate_host_key(path: &std::path::Path) -> Result<russh::keys
 
         info!("Saved host key to {}", path.display());
         Ok(key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_line_uses_crlf_only_with_a_pty() {
+        assert_eq!(status_line("agentman: hi", true), "agentman: hi\r\n");
+        assert_eq!(status_line("agentman: hi", false), "agentman: hi\n");
+    }
+
+    #[test]
+    fn pending_resizer_remembers_the_latest_size_until_ready() {
+        let r = PendingResizer::default();
+        assert!(r.resize_or_remember(80, 24).is_none());
+        assert!(r.resize_or_remember(120, 40).is_none());
+        assert_eq!(r.set_ready(Resizer::None), Some((120, 40)));
+        assert!(matches!(r.resize_or_remember(100, 30), Some(Resizer::None)));
+    }
+
+    #[test]
+    fn pending_resizer_without_resizes_has_nothing_to_apply() {
+        let r = PendingResizer::default();
+        assert_eq!(r.set_ready(Resizer::None), None);
+    }
+
+    #[test]
+    fn progress_messages_name_the_project() {
+        assert_eq!(
+            runtime::creating_message("agent"),
+            "agentman: creating sandbox agent (first connect, this can take a minute)..."
+        );
+        assert_eq!(
+            runtime::starting_message("agent"),
+            "agentman: starting sandbox agent..."
+        );
+        assert_eq!(
+            runtime::resuming_message("agent"),
+            "agentman: resuming sandbox agent..."
+        );
+    }
+
+    #[test]
+    fn keyboard_interactive_prompt_mentions_the_login_form() {
+        assert!(KBD_INTERACTIVE_INSTRUCTIONS.contains("project+githubuser@host"));
+    }
+
+    #[tokio::test]
+    async fn progress_closure_is_usable_as_runtime_progress() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let progress = move |msg: &str| {
+            let _ = tx.send(status_line(msg, true));
+        };
+        let p: runtime::Progress<'_> = &progress;
+        p(&runtime::creating_message("agent"));
+        p(&runtime::starting_message("agent"));
+        drop(progress);
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            "agentman: creating sandbox agent (first connect, this can take a minute)...\r\n"
+        );
+        assert_eq!(rx.recv().await.unwrap(), "agentman: starting sandbox agent...\r\n");
+        assert!(rx.recv().await.is_none());
     }
 }

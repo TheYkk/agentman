@@ -33,7 +33,7 @@ use crate::config::{DockerInSandboxMode, DockerIsolation, GatewayConfig, Runtime
 use crate::inner_docker;
 use crate::runtime::{
     KeyedLocks, DestroyOptions, DestroyResult, ExecOutput, ExecProcess, ExecSpec, Resizer, SandboxStats,
-    SandboxStatus,
+    SandboxStatus, Progress, creating_message, resuming_message, starting_message,
 };
 use crate::state::{StateManager, WorkspaceInfo};
 
@@ -245,6 +245,7 @@ impl ContainerManager {
         &self,
         github_user: &str,
         project: &str,
+        progress: Progress<'_>,
     ) -> Result<String> {
         // Ensure the host workspace directory is writable by the container user (needed for Zed/VS Code bootstraps).
         let workspace_path = self.config.workspace_path(github_user, project);
@@ -268,7 +269,7 @@ impl ContainerManager {
             } else if let Some(ref container_id) = workspace.container_id {
                 if self.container_exists(container_id).await? {
                     // Ensure it's running
-                    self.ensure_running(container_id).await?;
+                    self.ensure_running(container_id, project, progress).await?;
                     self.ensure_inner_dockerd(container_id).await;
                     return Ok(container_id.clone());
                 }
@@ -283,11 +284,12 @@ impl ContainerManager {
         // A create that outlived its session or the gateway may have left a container behind
         // that the state file never recorded; reuse it rather than reserving a new name.
         if let Some(found) = self.find_untracked_container(github_user, project).await? {
-            return self.adopt_container(github_user, project, found).await;
+            return self.adopt_container(github_user, project, found, progress).await;
         }
 
         // Create new container
-        self.create_container(github_user, project).await
+        progress(&creating_message(project));
+        self.create_container(github_user, project, progress).await
     }
 
     /// The newest managed container labeled with this workspace, if any: (id, name, created).
@@ -331,12 +333,13 @@ impl ContainerManager {
         github_user: &str,
         project: &str,
         (container_id, container_name, created): (String, String, Option<i64>),
+        progress: Progress<'_>,
     ) -> Result<String> {
         warn!(
             "Reusing untracked container {} for {}/{}",
             container_name, github_user, project
         );
-        self.ensure_running(&container_id).await?;
+        self.ensure_running(&container_id, project, progress).await?;
         self.ensure_inner_dockerd(&container_id).await;
         self.state
             .set_workspace(WorkspaceInfo {
@@ -355,7 +358,12 @@ impl ContainerManager {
     }
 
     /// Create a new container for the given user and project.
-    async fn create_container(&self, github_user: &str, project: &str) -> Result<String> {
+    async fn create_container(
+        &self,
+        github_user: &str,
+        project: &str,
+        progress: Progress<'_>,
+    ) -> Result<String> {
         let now = Utc::now();
         let date_str = now.format("%Y%m%d").to_string();
         let container_name = format!("{}-{}-{}", project, github_user, date_str);
@@ -430,7 +438,7 @@ impl ContainerManager {
                 );
                 for _ in 0..60 {
                     if let Some(found) = self.find_untracked_container(github_user, project).await? {
-                        return self.adopt_container(github_user, project, found).await;
+                        return self.adopt_container(github_user, project, found, progress).await;
                     }
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
@@ -450,6 +458,7 @@ impl ContainerManager {
         info!("Created container {} ({})", container_name, &container_id[..12]);
 
         // Start the container
+        progress(&starting_message(project));
         self.docker
             .start_container(&container_id, None::<StartContainerOptions>)
             .await
@@ -602,7 +611,12 @@ impl ContainerManager {
     }
 
     /// Ensure a container is running.
-    async fn ensure_running(&self, container_id: &str) -> Result<()> {
+    async fn ensure_running(
+        &self,
+        container_id: &str,
+        project: &str,
+        progress: Progress<'_>,
+    ) -> Result<()> {
         let info = self
             .docker
             .inspect_container(container_id, None::<InspectContainerOptions>)
@@ -624,6 +638,7 @@ impl ContainerManager {
         // Unpause it so users can reconnect cleanly.
         if paused {
             info!("Unpausing paused container {}", container_id);
+            progress(&resuming_message(project));
             self.docker
                 .unpause_container(container_id)
                 .await
@@ -632,6 +647,7 @@ impl ContainerManager {
 
         if !running {
             info!("Starting stopped container {}", container_id);
+            progress(&starting_message(project));
             self.docker
                 .start_container(container_id, None::<StartContainerOptions>)
                 .await
