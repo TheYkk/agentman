@@ -57,6 +57,9 @@ const POOL_TAG: &str = "agentman-pool";
 /// Tag on the template container that sandboxes are linked-cloned from.
 const TEMPLATE_TAG: &str = "agentman-template";
 
+/// Prefix of the tag naming the workspace a sandbox belongs to.
+const WORKSPACE_TAG_PREFIX: &str = "agentman-ws-";
+
 /// Prefix of the tag naming the gateway instance that owns a container.
 const GATEWAY_TAG_PREFIX: &str = "agentman-gw-";
 
@@ -90,17 +93,25 @@ fn is_named(name: &str, base: &str) -> bool {
 fn workspace_tag(github_user: &str, project: &str) -> String {
     let digest = Sha256::digest(format!("{github_user}/{project}").as_bytes());
     let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
-    format!("agentman-ws-{hex}")
+    format!("{WORKSPACE_TAG_PREFIX}{hex}")
 }
 
 /// Whether a lock on one of this instance's containers can only be left over from a `pct`
 /// operation that died with the gateway: on a template (`disk`/`clone` while a clone ran) or on
 /// an unfinished template or warm container (`create`). Workspace sandboxes are never touched.
 fn stale_lock(ct: &CtInfo) -> bool {
-    if ct.lock.is_none() || !ct.has_tag(TEMPLATE_TAG) {
-        return false;
-    }
-    ct.template || is_named(&ct.name, TEMPLATE_HOSTNAME) || is_named(&ct.name, POOL_HOSTNAME)
+    ct.lock.is_some() && ((ct.template && ct.has_tag(TEMPLATE_TAG)) || unfinished(ct))
+}
+
+/// A template or warm container the gateway stopped building half-way: named like one, not
+/// (yet) a template, and never finished as a warm container (`agentman-pool` tag) or handed to
+/// a workspace (`agentman-ws-*` tag). Depending on where it stopped, a clone still carries the
+/// template's tags or already just the base tags. Callers check ownership.
+fn unfinished(ct: &CtInfo) -> bool {
+    !ct.template
+        && (is_named(&ct.name, POOL_HOSTNAME) || is_named(&ct.name, TEMPLATE_HOSTNAME))
+        && !ct.has_tag(POOL_TAG)
+        && !ct.tags.iter().any(|t| t.starts_with(WORKSPACE_TAG_PREFIX))
 }
 
 /// The `agentman-gw-<id>` tag for `proxmox.instance_id`, or None for the default instance.
@@ -1325,7 +1336,7 @@ impl ProxmoxManager {
         let enabled = self.pcfg().linked_clones && !self.clones_disabled.load(Ordering::Relaxed);
 
         for ct in cts.iter().filter(|c| self.owns(c) && c.has_tag(TEMPLATE_TAG)) {
-            let half_built = !ct.template && is_named(&ct.name, TEMPLATE_HOSTNAME);
+            let half_built = unfinished(ct) && is_named(&ct.name, TEMPLATE_HOSTNAME);
             let stale = ct.template && (!enabled || !ct.has_tag(&specs.template));
             if half_built {
                 warn!("Removing unfinished template container {}", ct.vmid);
@@ -1533,11 +1544,11 @@ impl ProxmoxManager {
                     warn!("Failed to remove container {}: {:#}", ct.vmid, e);
                 }
             }
-            // Clones that never got their pool tag (the gateway stopped mid-way) still carry
-            // the template's tags.
-            for ct in cts.iter().filter(|c| {
-                self.owns(c) && c.has_tag(TEMPLATE_TAG) && !c.template && is_named(&c.name, POOL_HOSTNAME)
-            }) {
+            // Warm containers the gateway stopped building half-way (killed mid clone or tag).
+            for ct in cts
+                .iter()
+                .filter(|c| self.owns(c) && unfinished(c) && is_named(&c.name, POOL_HOSTNAME))
+            {
                 warn!("Removing unfinished warm container {}", ct.vmid);
                 if let Err(e) = self.delete_ct(&ct.vmid).await {
                     warn!("Failed to remove container {}: {:#}", ct.vmid, e);
@@ -2042,6 +2053,13 @@ mod tests {
         assert!(stale_lock(&ct("agentman-template", tmpl, 1, "disk")));
         assert!(stale_lock(&ct("agentman-pool-2", tmpl, 0, "create")));
         assert!(stale_lock(&ct("agentman-template", tmpl, 0, "create")));
+        // Killed after the clone's tags were reset but before the pool tag was added.
+        assert!(stale_lock(&ct("agentman-pool-1", "agentman;agentman-gw-test", 0, "create")));
+        assert!(unfinished(&ct("agentman-pool-1", "agentman;agentman-gw-test", 0, "")));
+        // Finished warm containers, claimed sandboxes and templates are not unfinished.
+        assert!(!unfinished(&ct("agentman-pool-1", "agentman;agentman-pool;agentman-spec-b", 0, "")));
+        assert!(!unfinished(&ct("agentman-pool", "agentman;agentman-ws-0123456789ab", 0, "")));
+        assert!(!unfinished(&ct("agentman-template", tmpl, 1, "")));
         // Not locked, or a workspace sandbox (even one still carrying template tags).
         assert!(!stale_lock(&ct("agentman-template", tmpl, 1, "")));
         assert!(!stale_lock(&ct("proj-user-20261014", tmpl, 0, "create")));
