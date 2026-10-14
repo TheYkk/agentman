@@ -180,6 +180,41 @@ fn carried_tags(ct: &CtInfo) -> Vec<String> {
         .collect()
 }
 
+/// Why an owned template-tagged container may be removed.
+#[derive(Debug, PartialEq, Eq)]
+enum TemplateRemoval {
+    /// The gateway died while building it.
+    HalfBuilt,
+    /// A finished template for an old spec (or with linked clones off): remove once no clone uses it.
+    IfUnused,
+}
+
+fn template_removal(ct: &CtInfo, spec: &str, enabled: bool) -> Option<TemplateRemoval> {
+    if unfinished(ct) && is_named(&ct.name, TEMPLATE_HOSTNAME) {
+        Some(TemplateRemoval::HalfBuilt)
+    } else if ct.template && (!enabled || !ct.has_tag(spec)) {
+        Some(TemplateRemoval::IfUnused)
+    } else {
+        None
+    }
+}
+
+/// Whether a container cloned from template `vmid` still exists (by its source tag).
+fn has_tagged_clone(vmid: &str, cts: &[CtInfo]) -> bool {
+    cts.iter().any(|c| c.has_tag(&from_tag(vmid)))
+}
+
+/// Whether a container config's volumes sit on template `vmid`'s base volume.
+fn config_uses_base(conf: &Value, vmid: &str) -> bool {
+    let base = format!("base-{vmid}-");
+    conf.as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(k, _)| *k == "rootfs" || k.starts_with("mp") || k.starts_with("unused"))
+        .filter_map(|(_, v)| v.as_str())
+        .any(|v| v.contains(&base))
+}
+
 fn spec_tag(digest: &[u8]) -> String {
     let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
     format!("agentman-spec-{hex}")
@@ -1364,21 +1399,17 @@ impl ProxmoxManager {
         let enabled = self.pcfg().linked_clones && !self.clones_disabled.load(Ordering::Relaxed);
 
         for ct in cts.iter().filter(|c| self.owns(c) && c.has_tag(TEMPLATE_TAG)) {
-            let half_built = unfinished(ct) && is_named(&ct.name, TEMPLATE_HOSTNAME);
-            let stale = ct.template && (!enabled || !ct.has_tag(&specs.template));
-            if half_built {
-                warn!("Removing unfinished template container {}", ct.vmid);
-            } else if stale {
-                match self.template_in_use(&ct.vmid, cts).await {
+            match template_removal(ct, &specs.template, enabled) {
+                Some(TemplateRemoval::HalfBuilt) => warn!("Removing unfinished template container {}", ct.vmid),
+                Some(TemplateRemoval::IfUnused) => match self.template_in_use(&ct.vmid, cts).await {
                     Ok(false) => info!("Removing old template container {}", ct.vmid),
                     Ok(true) => continue,
                     Err(e) => {
                         debug!("Cannot tell whether template {} is in use: {:#}", ct.vmid, e);
                         continue;
                     }
-                }
-            } else {
-                continue;
+                },
+                None => continue,
             }
             if let Err(e) = self.delete_ct(&ct.vmid).await {
                 warn!("Failed to remove container {}: {:#}", ct.vmid, e);
@@ -1418,21 +1449,13 @@ impl ProxmoxManager {
 
     /// Whether any container's root filesystem is a linked clone of template `vmid`.
     async fn template_in_use(&self, vmid: &str, cts: &[CtInfo]) -> Result<bool> {
-        if cts.iter().any(|c| c.has_tag(&from_tag(vmid))) {
+        if has_tagged_clone(vmid, cts) {
             return Ok(true);
         }
         // Clones from before the source tag: some storage names the base volume in the config.
-        let base = format!("base-{vmid}-");
         for ct in cts.iter().filter(|c| c.vmid != vmid) {
             let conf = self.api.get(&self.ct_path(&ct.vmid, "/config")).await?;
-            let uses = conf
-                .as_object()
-                .into_iter()
-                .flatten()
-                .filter(|(k, _)| *k == "rootfs" || k.starts_with("mp") || k.starts_with("unused"))
-                .filter_map(|(_, v)| v.as_str())
-                .any(|v| v.contains(&base));
-            if uses {
+            if config_uses_base(&conf, vmid) {
                 return Ok(true);
             }
         }
@@ -2121,6 +2144,42 @@ mod tests {
         assert_eq!(carried_tags(&ct), ["agentman-from-115"]);
         // A clone that is retagged but not yet in the pool still counts as unfinished.
         assert!(unfinished(&ct));
+    }
+
+    #[test]
+    fn old_template_is_removed_only_after_its_clones() {
+        let ct = |vmid: u32, name: &str, tags: &str, template: u8| {
+            CtInfo::from_value(&serde_json::json!({
+                "vmid": vmid, "name": name, "status": "stopped", "tags": tags, "template": template
+            }))
+            .unwrap()
+        };
+        let old = ct(115, "agentman-template", "agentman;agentman-template;agentman-spec-aaaaaaaaaaaa", 1);
+        let current = ct(118, "agentman-template-1", "agentman;agentman-template;agentman-spec-bbbbbbbbbbbb", 1);
+        let warm = ct(116, "agentman-pool", "agentman;agentman-from-115;agentman-pool;agentman-spec-a", 0);
+        let claimed = ct(117, "proj-user-20261014", "agentman;agentman-from-115;agentman-ws-0123456789ab", 0);
+        let spec = "agentman-spec-bbbbbbbbbbbb";
+
+        // A spec change makes the old template removable once unused; the current one stays.
+        assert_eq!(template_removal(&old, spec, true), Some(TemplateRemoval::IfUnused));
+        assert_eq!(template_removal(&current, spec, true), None);
+        assert_eq!(template_removal(&current, spec, false), Some(TemplateRemoval::IfUnused));
+
+        // Kept while a warm or claimed clone exists, removable after both are destroyed.
+        let mut cts = vec![old, current, warm, claimed];
+        assert!(has_tagged_clone("115", &cts));
+        cts.retain(|c| c.vmid != "116");
+        assert!(has_tagged_clone("115", &cts));
+        cts.retain(|c| c.vmid != "117");
+        assert!(!has_tagged_clone("115", &cts));
+        assert!(!has_tagged_clone("118", &cts));
+
+        // Clones from before the source tag are found by their base volume.
+        let linked = serde_json::json!({"rootfs": "local:115/base-115-disk-0.raw/117/vm-117-disk-0.raw,size=8G"});
+        let full = serde_json::json!({"rootfs": "local-lvm:vm-117-disk-0,size=8G", "mp0": "/srv/ws,mp=/workspace"});
+        assert!(config_uses_base(&linked, "115"));
+        assert!(!config_uses_base(&linked, "11"));
+        assert!(!config_uses_base(&full, "115"));
     }
 
     #[test]
