@@ -1549,7 +1549,21 @@ const HERDR_ATTACH_SCRIPT: &str = r#"if command -v herdr >/dev/null 2>&1; then
     [ "$i" -eq 5 ] && echo "Waiting for herdr to start..." >&2
     sleep 0.2
   done
-  if herdr_up; then exec herdr; fi
+  if herdr_up; then
+    # On a fresh sandbox, give the image's default-agent script a moment to open its
+    # /workspace workspace first; a client attaching to an empty server gets a default
+    # workspace of its own instead.
+    if command -v jq >/dev/null 2>&1; then
+      i=0
+      until herdr pane list 2>/dev/null | jq -e '(.result.panes // []) | length > 0' >/dev/null 2>&1; do
+        i=$((i + 1))
+        [ "$i" -ge "${AGENTMAN_HERDR_WAIT_TICKS:-75}" ] && break
+        sleep 0.2
+      done
+    fi
+    cd /workspace 2>/dev/null
+    exec herdr
+  fi
   echo "herdr is not running in this sandbox; starting a plain shell." >&2
 fi
 exec /bin/bash -l"#;
@@ -1733,7 +1747,7 @@ mod tests {
     fn pty_shell_attaches_to_herdr() {
         let cmd = interactive_shell_cmd(ShellMode::Herdr, true);
         assert_eq!(cmd[..2], ["/bin/bash", "-lc"]);
-        assert!(cmd[2].contains("exec herdr;"));
+        assert!(cmd[2].contains("exec herdr\n"));
         assert!(cmd[2].contains("exec /bin/bash -l"));
         assert!(!cmd[2].contains("tmux"));
     }
@@ -1748,7 +1762,7 @@ mod tests {
     /// Runs the attach script with `bin` prepended to PATH and returns its stdout.
     fn run_attach_script(bin: &std::path::Path) -> String {
         let path = format!("{}:/usr/bin:/bin", bin.display());
-        // Keep the "never comes up" case fast; the real wait is 150 ticks of 0.2s.
+        // Keep the "never comes up" cases fast; the real waits are 30s and 15s.
         let out = Command::new("/bin/bash")
             .arg("-c")
             .arg(HERDR_ATTACH_SCRIPT)
@@ -1789,38 +1803,59 @@ mod tests {
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    /// Fake `herdr`: `status server` reports "not running" (exit 0, like the real one) for
-    /// the first `ready_after - 1` probes and "running" after that; bare `herdr` is the
-    /// client attach.
-    fn fake_herdr(dir: &std::path::Path, ready_after: u32) {
-        let n = dir.join("probes");
+    /// Fake `herdr`. `status server` reports "not running" (exit 0, like the real one) until
+    /// probe `ready_after`, then "running". `pane list` is empty until call `panes_after`.
+    /// Bare `herdr` is the client attach and reports how many of each call it saw.
+    fn fake_herdr(dir: &std::path::Path, ready_after: u32, panes_after: u32) {
+        let d = dir.display();
         write_script(
             dir,
             "herdr",
             &format!(
-                r#"if [ "$1" = status ]; then
-  n=$(cat {n} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {n}
+                r#"count() {{ n=$(cat {d}/$1 2>/dev/null || echo 0); n=$((n+1)); echo $n > {d}/$1; }}
+case "$1" in
+status)
+  count status
   if [ "$n" -ge {ready_after} ]; then echo "status: running"; else echo "status: not running"; fi
-  exit 0
-fi
-echo "attached args=[$*] probes=$(cat {n})""#,
-                n = n.display()
+  exit 0 ;;
+pane)
+  count panes
+  if [ "$n" -ge {panes_after} ]; then echo '{{"result":{{"panes":[{{"pane_id":"p1"}}]}}}}'
+  else echo '{{"result":{{"panes":[]}}}}'; fi
+  exit 0 ;;
+esac
+echo "attached args=[$*] status=$(cat {d}/status) panes=$(cat {d}/panes)""#
             ),
         );
     }
 
     #[test]
-    fn attach_script_waits_for_server_then_execs_herdr() {
+    fn attach_script_waits_for_server_and_workspace_then_execs_herdr() {
         let dir = TempDir::new("herdr-attach");
-        fake_herdr(dir.path(), 3);
-        // Probes 1 and 2 say "not running", 3 says running, and one more confirms before exec.
-        assert_eq!(run_attach_script(dir.path()), "attached args=[] probes=4\n");
+        fake_herdr(dir.path(), 3, 2);
+        // Status probes 1 and 2 say "not running", 3 says running, one more confirms. Then
+        // the first pane list is empty and the second has the default agent's workspace.
+        assert_eq!(
+            run_attach_script(dir.path()),
+            "attached args=[] status=4 panes=2\n"
+        );
+    }
+
+    #[test]
+    fn attach_script_attaches_without_workspace_after_timeout() {
+        let dir = TempDir::new("herdr-no-workspace");
+        fake_herdr(dir.path(), 1, u32::MAX);
+        // No default agent ever opens a workspace: attach anyway once the wait runs out.
+        assert_eq!(
+            run_attach_script(dir.path()),
+            "attached args=[] status=2 panes=10\n"
+        );
     }
 
     #[test]
     fn attach_script_never_starts_client_without_server() {
         let dir = TempDir::new("herdr-never-up");
-        fake_herdr(dir.path(), u32::MAX);
+        fake_herdr(dir.path(), u32::MAX, 1);
         // The server never comes up: give a shell (reading empty stdin), not the client.
         assert_eq!(run_attach_script(dir.path()), "");
     }
