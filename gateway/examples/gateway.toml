@@ -137,6 +137,13 @@ exec_env = [
 
 lxc_bin_dir = "/usr/bin"
 pct_path = "/usr/sbin/pct"
+pvesm_path = "/usr/sbin/pvesm"
+
+# Fast startup (see README). Containers kept created and stopped for new projects (0 = off).
+warm_pool_size = 1
+# Unpack ostemplate once into a template container and linked-clone sandboxes from it
+# (needs lvmthin/zfspool/rbd storage; falls back to unpacking elsewhere).
+linked_clones = true
 
 [docker_in_sandbox]
 # Give each sandbox its own Docker daemon so `docker build` / `docker run` work inside it.

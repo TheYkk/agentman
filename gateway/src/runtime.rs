@@ -235,6 +235,18 @@ impl Runtime {
         }
     }
 
+    /// Start background work: the Proxmox warm pool and template upkeep.
+    pub fn spawn_background(self: &Arc<Self>) {
+        if let Self::Proxmox(_) = **self {
+            let rt = self.clone();
+            tokio::spawn(async move {
+                if let Self::Proxmox(m) = &*rt {
+                    m.run_pool_loop().await;
+                }
+            });
+        }
+    }
+
     /// Get or create the sandbox for (github_user, project). Returns its id.
     ///
     /// `progress` is told before any slow step (creating, starting or resuming the sandbox).

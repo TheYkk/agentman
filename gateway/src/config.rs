@@ -229,6 +229,18 @@ pub struct ProxmoxConfig {
 
     /// Path to `pct`.
     pub pct_path: PathBuf,
+
+    /// Path to `pvesm` (used to find the `ostemplate` file and notice when it is rebuilt).
+    pub pvesm_path: PathBuf,
+
+    /// Number of ready containers (created, stopped, not yet assigned to a project) kept on
+    /// hand so a new project only has to configure and start one. 0 disables the warm pool.
+    pub warm_pool_size: u32,
+
+    /// Unpack `ostemplate` once into a template container and create sandboxes as linked
+    /// clones of it, which takes seconds instead of a minute. Needs storage with snapshot
+    /// clones (lvmthin, zfspool, rbd); elsewhere the gateway falls back to unpacking.
+    pub linked_clones: bool,
 }
 
 impl Default for ProxmoxConfig {
@@ -272,6 +284,9 @@ impl Default for ProxmoxConfig {
             ],
             lxc_bin_dir: PathBuf::from("/usr/bin"),
             pct_path: PathBuf::from("/usr/sbin/pct"),
+            pvesm_path: PathBuf::from("/usr/sbin/pvesm"),
+            warm_pool_size: 1,
+            linked_clones: true,
         }
     }
 }
