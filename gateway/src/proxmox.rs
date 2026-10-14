@@ -60,6 +60,10 @@ const TEMPLATE_TAG: &str = "agentman-template";
 /// Prefix of the tag naming the workspace a sandbox belongs to.
 const WORKSPACE_TAG_PREFIX: &str = "agentman-ws-";
 
+/// Prefix of the tag naming the template a linked clone was made from. Linked clones cannot be
+/// told apart by their config on every storage (lvmthin shows only `vm-<id>-disk-0`).
+const FROM_TAG_PREFIX: &str = "agentman-from-";
+
 /// Prefix of the tag naming the gateway instance that owns a container.
 const GATEWAY_TAG_PREFIX: &str = "agentman-gw-";
 
@@ -161,6 +165,19 @@ fn destroy_targets(
     targets.sort_by_key(CtInfo::vmid_num);
     targets.dedup_by(|a, b| a.vmid == b.vmid);
     targets
+}
+
+fn from_tag(template_vmid: &str) -> String {
+    format!("{FROM_TAG_PREFIX}{template_vmid}")
+}
+
+/// Tags that must survive retagging a container (when it joins the pool or a workspace).
+fn carried_tags(ct: &CtInfo) -> Vec<String> {
+    ct.tags
+        .iter()
+        .filter(|t| t.starts_with(FROM_TAG_PREFIX))
+        .cloned()
+        .collect()
 }
 
 fn spec_tag(digest: &[u8]) -> String {
@@ -723,6 +740,15 @@ impl ProxmoxManager {
         &self.config.proxmox
     }
 
+    /// The tags of container `vmid` that retagging must keep (see [`carried_tags`]).
+    async fn carried_tags(&self, vmid: &str) -> Result<Vec<String>> {
+        Ok(self
+            .find_ct(vmid)
+            .await?
+            .map(|ct| carried_tags(&ct))
+            .unwrap_or_default())
+    }
+
     fn owns(&self, ct: &CtInfo) -> bool {
         owned(ct, self.gw_tag.as_deref())
     }
@@ -1112,11 +1138,13 @@ impl ProxmoxManager {
         let description = format!("Managed by agentman for {github_user}/{project}");
         let mp0 = format!("{},mp={}", workspace_path.display(), WORKSPACE_MOUNT);
         let ws_tag = workspace_tag(github_user, project);
-        let tags = if self.inner_docker {
-            self.tags_with(&[INNER_DOCKER_TAG, &ws_tag])
-        } else {
-            self.tags_with(&[&ws_tag])
-        };
+        let carried = self.carried_tags(vmid).await?;
+        let mut extra: Vec<&str> = carried.iter().map(String::as_str).collect();
+        if self.inner_docker {
+            extra.push(INNER_DOCKER_TAG);
+        }
+        extra.push(&ws_tag);
+        let tags = self.tags_with(&extra);
         let mut pct_args = vec![
             "set",
             vmid,
@@ -1238,7 +1266,7 @@ impl ProxmoxManager {
             .into_iter()
             .map(|(k, v)| (format!("--{k}"), v))
             .collect();
-        let tags = self.tags_with(&[]);
+        let tags = self.tags_with(&[&from_tag(template)]);
         let mut args = vec!["set", vmid.as_str(), "--tags", tags.as_str()];
         for (k, v) in &opts {
             args.extend([k.as_str(), v.as_str()]);
@@ -1390,6 +1418,10 @@ impl ProxmoxManager {
 
     /// Whether any container's root filesystem is a linked clone of template `vmid`.
     async fn template_in_use(&self, vmid: &str, cts: &[CtInfo]) -> Result<bool> {
+        if cts.iter().any(|c| c.has_tag(&from_tag(vmid))) {
+            return Ok(true);
+        }
+        // Clones from before the source tag: some storage names the base volume in the config.
         let base = format!("base-{vmid}-");
         for ct in cts.iter().filter(|c| c.vmid != vmid) {
             let conf = self.api.get(&self.ct_path(&ct.vmid, "/config")).await?;
@@ -1578,7 +1610,19 @@ impl ProxmoxManager {
         let vmid = self
             .provision_blank(&hostname, "agentman warm pool: ready for the next new project")
             .await?;
-        let tags = self.tags_with(&[POOL_TAG, &specs.pool]);
+        let tags = match self.carried_tags(&vmid).await {
+            Ok(carried) => {
+                let mut extra: Vec<&str> = carried.iter().map(String::as_str).collect();
+                extra.extend([POOL_TAG, specs.pool.as_str()]);
+                self.tags_with(&extra)
+            }
+            Err(e) => {
+                if let Err(e2) = self.delete_ct(&vmid).await {
+                    warn!("Cleanup of container {} failed: {:#}", vmid, e2);
+                }
+                return Err(e);
+            }
+        };
         if let Err(e) = self
             .run_tool(&self.pcfg().pct_path, &["set", &vmid, "--tags", &tags])
             .await
@@ -2064,6 +2108,19 @@ mod tests {
         assert!(!stale_lock(&ct("agentman-template", tmpl, 1, "")));
         assert!(!stale_lock(&ct("proj-user-20261014", tmpl, 0, "create")));
         assert!(!stale_lock(&ct("proj-user-20261014", "agentman", 0, "backup")));
+    }
+
+    #[test]
+    fn clone_source_tag_survives_retagging() {
+        let ct = CtInfo::from_value(&serde_json::json!({
+            "vmid": 117, "name": "agentman-pool", "status": "stopped",
+            "tags": "agentman;agentman-from-115;agentman-gw-test", "template": 0
+        }))
+        .unwrap();
+        assert!(ct.has_tag(&from_tag("115")));
+        assert_eq!(carried_tags(&ct), ["agentman-from-115"]);
+        // A clone that is retagged but not yet in the pool still counts as unfinished.
+        assert!(unfinished(&ct));
     }
 
     #[test]
