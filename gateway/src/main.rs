@@ -123,6 +123,7 @@ async fn main() -> Result<()> {
                 .context("Failed to initialize Proxmox LXC manager")?,
         ),
     });
+    runtime.spawn_background();
 
     // Run SSH server
     ssh::run_server(config, state, runtime, github_fetcher).await?;

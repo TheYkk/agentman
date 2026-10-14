@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,9 +22,10 @@ use futures::stream::{self, BoxStream};
 use futures::{FutureExt, StreamExt};
 use reqwest::Method;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::config::{DockerInSandboxMode, GatewayConfig, ProxmoxConfig, RuntimeKind};
@@ -48,6 +50,42 @@ const IMAGE_ENV_FILE: &str = "/etc/agentman/image.env";
 /// Tag marking containers created with Docker-in-sandbox (the LXC analogue of the
 /// `agentman.inner_docker` Docker label).
 const INNER_DOCKER_TAG: &str = "agentman-dind";
+
+/// Tag on warm-pool containers: created and stopped, waiting for a new project.
+const POOL_TAG: &str = "agentman-pool";
+
+/// Tag on the template container that sandboxes are linked-cloned from.
+const TEMPLATE_TAG: &str = "agentman-template";
+
+/// Hostnames (prefixes) of warm-pool and template containers.
+const POOL_HOSTNAME: &str = "agentman-pool";
+const TEMPLATE_HOSTNAME: &str = "agentman-template";
+
+/// What the template and warm-pool containers are built from, as tags
+/// (`agentman-spec-<hash>`); a mismatch means they are stale.
+#[derive(Debug, Clone)]
+struct Specs {
+    /// `ostemplate` (and its file's size and mtime), storage, rootfs size, privilege, ostype, pool.
+    template: String,
+    /// The template spec plus memory, CPU and network.
+    pool: String,
+}
+
+/// Whether `name` is `base` or a [`ProxmoxManager::unique_hostname`] variant of it (`base-N`).
+fn is_named(name: &str, base: &str) -> bool {
+    match name.strip_prefix(base) {
+        Some("") => true,
+        Some(rest) => rest
+            .strip_prefix('-')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
+        None => false,
+    }
+}
+
+fn spec_tag(digest: &[u8]) -> String {
+    let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    format!("agentman-spec-{hex}")
+}
 
 /// Minimal Proxmox VE API client authenticated with an API token.
 struct ProxmoxApi {
@@ -420,6 +458,8 @@ struct CtInfo {
     name: String,
     status: String,
     tags: Vec<String>,
+    /// Converted to a template (`pct template`).
+    template: bool,
     cpu: Option<f64>,
     cpus: Option<f64>,
     mem: Option<u64>,
@@ -444,6 +484,7 @@ impl CtInfo {
                 .filter(|t| !t.is_empty())
                 .map(str::to_string)
                 .collect(),
+            template: v.get("template").and_then(value_u64) == Some(1),
             cpu: v.get("cpu").and_then(Value::as_f64),
             cpus: v.get("cpus").and_then(|c| c.as_f64().or_else(|| value_u64(c).map(|n| n as f64))),
             mem: v.get("mem").and_then(value_u64),
@@ -452,7 +493,15 @@ impl CtInfo {
     }
 
     fn is_managed(&self) -> bool {
-        self.tags.iter().any(|t| t == AGENTMAN_TAG)
+        self.has_tag(AGENTMAN_TAG)
+    }
+
+    fn has_tag(&self, tag: &str) -> bool {
+        self.tags.iter().any(|t| t == tag)
+    }
+
+    fn vmid_num(&self) -> u64 {
+        self.vmid.parse().unwrap_or(u64::MAX)
     }
 }
 
@@ -467,6 +516,16 @@ pub struct ProxmoxManager {
     /// Whether new containers run their own Docker daemon (`docker_in_sandbox.mode != off`).
     inner_docker: bool,
     create_locks: KeyedLocks,
+    /// Current template and pool specs, computed by the pool loop.
+    specs: RwLock<Option<Specs>>,
+    /// (template spec, VMID) of the ready template; locked while one is being built.
+    template: tokio::sync::Mutex<Option<(String, String)>>,
+    /// Set when linked clones failed; sandboxes are then unpacked from `ostemplate`.
+    clones_disabled: AtomicBool,
+    /// Serializes claiming warm containers against removing stale ones.
+    pool_lock: tokio::sync::Mutex<()>,
+    /// Wakes the pool loop to refill.
+    pool_notify: Notify,
 }
 
 impl ProxmoxManager {
@@ -516,6 +575,11 @@ impl ProxmoxManager {
             container_env: RwLock::new(HashMap::new()),
             inner_docker,
             create_locks: KeyedLocks::default(),
+            specs: RwLock::new(None),
+            template: tokio::sync::Mutex::new(None),
+            clones_disabled: AtomicBool::new(false),
+            pool_lock: tokio::sync::Mutex::new(()),
+            pool_notify: Notify::new(),
         })
     }
 
@@ -634,7 +698,6 @@ impl ProxmoxManager {
             );
         }
 
-        progress(&creating_message(project));
         self.create_container(github_user, project, progress).await
     }
 
@@ -726,7 +789,8 @@ impl ProxmoxManager {
         Ok(name)
     }
 
-    fn create_params(&self, vmid: &str, hostname: &str, github_user: &str, project: &str) -> Result<Vec<(&'static str, String)>> {
+    /// Memory, CPU and network options, shared by fresh containers and clones.
+    fn resource_options(&self) -> Result<Vec<(&'static str, String)>> {
         let pcfg = self.pcfg();
         let security = &self.config.container_security;
 
@@ -740,26 +804,31 @@ impl ProxmoxManager {
             net0.push_str(&format!(",gw={gw}"));
         }
 
+        let mut opts = vec![
+            ("memory", memory_mb.to_string()),
+            ("swap", pcfg.swap_mb.to_string()),
+            ("net0", net0),
+        ];
+        if let Some(cpu) = security.cpu_limit {
+            opts.push(("cores", (cpu.ceil().max(1.0) as u64).to_string()));
+            opts.push(("cpulimit", format!("{cpu}")));
+        }
+        Ok(opts)
+    }
+
+    fn create_params(&self, vmid: &str, hostname: &str, description: &str) -> Result<Vec<(&'static str, String)>> {
+        let pcfg = self.pcfg();
         let mut params: Vec<(&'static str, String)> = vec![
             ("vmid", vmid.to_string()),
             ("ostemplate", pcfg.ostemplate.clone()),
             ("hostname", hostname.to_string()),
             ("rootfs", format!("{}:{}", pcfg.storage, pcfg.rootfs_size_gb)),
-            ("memory", memory_mb.to_string()),
-            ("swap", pcfg.swap_mb.to_string()),
-            ("net0", net0),
             ("unprivileged", if pcfg.unprivileged { "1" } else { "0" }.to_string()),
-            (
-                "description",
-                format!("Managed by agentman for {github_user}/{project}"),
-            ),
+            ("description", description.to_string()),
             ("onboot", "0".to_string()),
             ("start", "0".to_string()),
         ];
-        if let Some(cpu) = security.cpu_limit {
-            params.push(("cores", (cpu.ceil().max(1.0) as u64).to_string()));
-            params.push(("cpulimit", format!("{cpu}")));
-        }
+        params.extend(self.resource_options()?);
         if let Some(ref ostype) = pcfg.ostype {
             params.push(("ostype", ostype.clone()));
         }
@@ -769,7 +838,8 @@ impl ProxmoxManager {
         Ok(params)
     }
 
-    /// Create a new container for the given user and project.
+    /// Create a new container for the given user and project: claim a warm one if there is
+    /// one, otherwise provision it now (a linked clone, or unpacking `ostemplate`).
     async fn create_container(
         &self,
         github_user: &str,
@@ -785,74 +855,28 @@ impl ProxmoxManager {
         let workspace_path = self.config.workspace_path(github_user, project);
         ensure_workspace_writable(&workspace_path, self.config.workspace_owner()).await?;
 
-        // /cluster/nextid can race with other creators; retry with a fresh id if creation fails.
-        let mut last_err = None;
-        let mut vmid = String::new();
-        for _ in 0..3 {
-            let next = self.api.get("/cluster/nextid").await?;
-            vmid = value_u64(&next)
-                .ok_or_else(|| anyhow!("Unexpected /cluster/nextid response: {next}"))?
-                .to_string();
-
-            info!(
-                "Creating LXC container {} ({}) for {}/{}",
-                vmid, hostname, github_user, project
-            );
-            let params = self.create_params(&vmid, &hostname, github_user, project)?;
-            let res = async {
-                let upid = self
-                    .api
-                    .post(&format!("/nodes/{}/lxc", encode_path_segment(&self.node)), &params)
-                    .await?;
-                self.api
-                    .wait_task(&self.node, &upid, Duration::from_secs(600))
+        let vmid = match self
+            .claim_pool_ct(&hostname, github_user, project, &workspace_path)
+            .await
+        {
+            Some(vmid) => vmid,
+            None => {
+                progress(&creating_message(project));
+                let description = format!("Managed by agentman for {github_user}/{project}");
+                let vmid = self.provision_blank(&hostname, &description).await?;
+                if let Err(e) = self
+                    .assign(&vmid, &hostname, github_user, project, &workspace_path)
                     .await
-            }
-            .await;
-            match res {
-                Ok(()) => {
-                    last_err = None;
-                    break;
+                {
+                    warn!("Removing container {} after failed setup", vmid);
+                    if let Err(e2) = self.delete_ct(&vmid).await {
+                        warn!("Cleanup of container {} failed: {:#}", vmid, e2);
+                    }
+                    return Err(e);
                 }
-                Err(e) if format!("{e:#}").contains("already exists") => {
-                    warn!("VMID {} was taken, retrying: {:#}", vmid, e);
-                    last_err = Some(e);
-                }
-                Err(e) => return Err(e.context(format!("Failed to create container {hostname}"))),
+                vmid
             }
-        }
-        if let Some(e) = last_err {
-            return Err(e.context(format!("Failed to create container {hostname}")));
-        }
-
-        // Bind mount the persistent workspace, set feature flags and tags. Proxmox only lets
-        // root@pam add bind mounts and change features other than nesting, and checks tags
-        // against /vms/<id> (which a pool-scoped token lacks), so this goes through `pct`.
-        let mp0 = format!("{},mp={}", workspace_path.display(), WORKSPACE_MOUNT);
-        let tags = if self.inner_docker {
-            format!("{AGENTMAN_TAG};{INNER_DOCKER_TAG}")
-        } else {
-            AGENTMAN_TAG.to_string()
         };
-        let mut pct_args = vec![
-            "set",
-            vmid.as_str(),
-            "--mp0",
-            mp0.as_str(),
-            "--tags",
-            tags.as_str(),
-        ];
-        let features = self.pcfg().features(self.inner_docker);
-        if let Some(ref features) = features {
-            pct_args.extend(["--features", features.as_str()]);
-        }
-        if let Err(e) = self.run_tool(&self.pcfg().pct_path, &pct_args).await {
-            warn!("Removing container {} after failed setup", vmid);
-            if let Err(e2) = self.delete_ct(&vmid).await {
-                warn!("Cleanup of container {} failed: {:#}", vmid, e2);
-            }
-            return Err(e.context("Failed to configure the container (bind mount/features/tags)"));
-        }
 
         progress(&starting_message(project));
         let upid = self
@@ -883,6 +907,500 @@ impl ProxmoxManager {
             self.ensure_inner_dockerd(&vmid).await;
         }
         Ok(vmid)
+    }
+
+    /// Turn a stopped, unassigned container into the given project's sandbox.
+    ///
+    /// Bind mount the persistent workspace, set feature flags and tags. Proxmox only lets
+    /// root@pam add bind mounts and change features other than nesting, and checks tags
+    /// against /vms/<id> (which a pool-scoped token lacks), so this goes through `pct`.
+    async fn assign(
+        &self,
+        vmid: &str,
+        hostname: &str,
+        github_user: &str,
+        project: &str,
+        workspace_path: &Path,
+    ) -> Result<()> {
+        let description = format!("Managed by agentman for {github_user}/{project}");
+        let mp0 = format!("{},mp={}", workspace_path.display(), WORKSPACE_MOUNT);
+        let tags = if self.inner_docker {
+            format!("{AGENTMAN_TAG};{INNER_DOCKER_TAG}")
+        } else {
+            AGENTMAN_TAG.to_string()
+        };
+        let mut pct_args = vec![
+            "set",
+            vmid,
+            "--hostname",
+            hostname,
+            "--description",
+            description.as_str(),
+            "--mp0",
+            mp0.as_str(),
+            "--tags",
+            tags.as_str(),
+        ];
+        let features = self.pcfg().features(self.inner_docker);
+        if let Some(ref features) = features {
+            pct_args.extend(["--features", features.as_str()]);
+        }
+        self.run_tool(&self.pcfg().pct_path, &pct_args)
+            .await
+            .context("Failed to configure the container (bind mount/features/tags)")
+    }
+
+    /// Provision a stopped container with no workspace: a linked clone of the template when
+    /// one is ready, otherwise a fresh container unpacked from `ostemplate`.
+    async fn provision_blank(&self, hostname: &str, description: &str) -> Result<String> {
+        if let Some(template) = self.ready_template().await {
+            match self.clone_template(&template, hostname, description).await {
+                Ok(vmid) => return Ok(vmid),
+                Err(e) => {
+                    warn!(
+                        "Linked clone of template {} failed, unpacking {} from now on: {:#}",
+                        template,
+                        self.pcfg().ostemplate,
+                        e
+                    );
+                    self.clones_disabled.store(true, Ordering::Relaxed);
+                    self.pool_notify.notify_one();
+                }
+            }
+        }
+        self.create_from_ostemplate(hostname, description).await
+    }
+
+    /// Create a stopped container by unpacking `ostemplate` (slow: the whole image is extracted).
+    async fn create_from_ostemplate(&self, hostname: &str, description: &str) -> Result<String> {
+        // /cluster/nextid can race with other creators; retry with a fresh id if creation fails.
+        let mut last_err = None;
+        for _ in 0..3 {
+            let vmid = self.next_vmid().await?;
+            info!("Creating LXC container {} ({}) from {}", vmid, hostname, self.pcfg().ostemplate);
+            let params = self.create_params(&vmid, hostname, description)?;
+            let res = async {
+                let upid = self
+                    .api
+                    .post(&format!("/nodes/{}/lxc", encode_path_segment(&self.node)), &params)
+                    .await?;
+                self.api
+                    .wait_task(&self.node, &upid, Duration::from_secs(600))
+                    .await
+            }
+            .await;
+            match res {
+                Ok(()) => return Ok(vmid),
+                Err(e) if format!("{e:#}").contains("already exists") => {
+                    warn!("VMID {} was taken, retrying: {:#}", vmid, e);
+                    last_err = Some(e);
+                }
+                Err(e) => return Err(e.context(format!("Failed to create container {hostname}"))),
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| anyhow!("no VMID"))
+            .context(format!("Failed to create container {hostname}")))
+    }
+
+    async fn next_vmid(&self) -> Result<String> {
+        let next = self.api.get("/cluster/nextid").await?;
+        Ok(value_u64(&next)
+            .ok_or_else(|| anyhow!("Unexpected /cluster/nextid response: {next}"))?
+            .to_string())
+    }
+
+    /// Create a stopped linked clone of `template` with this gateway's memory/CPU/network.
+    /// Cloning needs `VM.Clone`, which the pool-scoped token does not have, so it runs `pct`.
+    async fn clone_template(&self, template: &str, hostname: &str, description: &str) -> Result<String> {
+        let pct = &self.pcfg().pct_path;
+        let mut last_err = None;
+        let mut cloned = None;
+        for _ in 0..3 {
+            let vmid = self.next_vmid().await?;
+            info!("Cloning template {} to LXC container {} ({})", template, vmid, hostname);
+            let mut args = vec![
+                "clone", template, vmid.as_str(),
+                "--full", "0",
+                "--hostname", hostname,
+                "--description", description,
+            ];
+            if let Some(ref pool) = self.pcfg().pool {
+                args.extend(["--pool", pool.as_str()]);
+            }
+            match self.run_tool(pct, &args).await {
+                Ok(()) => {
+                    cloned = Some(vmid);
+                    break;
+                }
+                Err(e) if format!("{e:#}").contains("already exists") => {
+                    warn!("VMID {} was taken, retrying: {:#}", vmid, e);
+                    last_err = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let Some(vmid) = cloned else {
+            return Err(last_err.unwrap_or_else(|| anyhow!("no VMID")));
+        };
+
+        // The clone carries the template's tags; reset them along with the resources.
+        let opts: Vec<(String, String)> = self
+            .resource_options()?
+            .into_iter()
+            .map(|(k, v)| (format!("--{k}"), v))
+            .collect();
+        let mut args = vec!["set", vmid.as_str(), "--tags", AGENTMAN_TAG];
+        for (k, v) in &opts {
+            args.extend([k.as_str(), v.as_str()]);
+        }
+        if let Err(e) = self.run_tool(pct, &args).await {
+            if let Err(e2) = self.delete_ct(&vmid).await {
+                warn!("Cleanup of container {} failed: {:#}", vmid, e2);
+            }
+            return Err(e.context("Failed to configure the cloned container"));
+        }
+        Ok(vmid)
+    }
+
+    /// Spec tags identifying what the template and warm-pool containers were built from, so
+    /// stale ones are replaced after the template file or the container settings change.
+    async fn compute_specs(&self) -> Result<Specs> {
+        let pcfg = self.pcfg();
+        let stamp = self.ostemplate_stamp().await;
+        let rootfs_size = pcfg.rootfs_size_gb.to_string();
+        let mut h = Sha256::new();
+        for part in [
+            "v1",
+            pcfg.ostemplate.as_str(),
+            stamp.as_str(),
+            pcfg.storage.as_str(),
+            rootfs_size.as_str(),
+            if pcfg.unprivileged { "unprivileged" } else { "privileged" },
+            pcfg.ostype.as_deref().unwrap_or(""),
+            pcfg.pool.as_deref().unwrap_or(""),
+        ] {
+            h.update(part.as_bytes());
+            h.update([0]);
+        }
+        let template = spec_tag(&h.clone().finalize());
+        for (k, v) in self.resource_options()? {
+            h.update(k.as_bytes());
+            h.update(b"=");
+            h.update(v.as_bytes());
+            h.update([0]);
+        }
+        let pool = spec_tag(&h.finalize());
+        Ok(Specs { template, pool })
+    }
+
+    /// Size and mtime of the `ostemplate` file, so a rebuilt template under the same name is
+    /// noticed. Empty if the file cannot be found (the volume id alone then identifies it).
+    async fn ostemplate_stamp(&self) -> String {
+        let out = Command::new(&self.pcfg().pvesm_path)
+            .args(["path", &self.pcfg().ostemplate])
+            .stdin(Stdio::null())
+            .output()
+            .await;
+        let path = match out {
+            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            Ok(out) => {
+                debug!("pvesm path {} failed: {}", self.pcfg().ostemplate, String::from_utf8_lossy(&out.stderr).trim());
+                return String::new();
+            }
+            Err(e) => {
+                debug!("Failed to run pvesm: {}", e);
+                return String::new();
+            }
+        };
+        match tokio::fs::metadata(&path).await {
+            Ok(meta) => {
+                use std::os::unix::fs::MetadataExt;
+                format!("{}:{}", meta.len(), meta.mtime())
+            }
+            Err(e) => {
+                debug!("Failed to stat {}: {}", path, e);
+                String::new()
+            }
+        }
+    }
+
+    /// The template to clone from right now, without waiting for one to be built.
+    async fn ready_template(&self) -> Option<String> {
+        if !self.pcfg().linked_clones || self.clones_disabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let current = self.specs.read().await.as_ref()?.template.clone();
+        // Busy means a build is in progress: don't wait a minute for it.
+        let cached = self.template.try_lock().ok()?;
+        match cached.as_ref() {
+            Some((spec, vmid)) if *spec == current => Some(vmid.clone()),
+            _ => None,
+        }
+    }
+
+    /// Make sure the template container for `specs` exists (building it if needed) and remove
+    /// stale templates no clone uses any more. Returns the current template's VMID, or None
+    /// when linked clones are off or unsupported.
+    async fn ensure_template(&self, specs: &Specs, cts: &[CtInfo]) -> Option<String> {
+        let mut cached = self.template.lock().await;
+        let enabled = self.pcfg().linked_clones && !self.clones_disabled.load(Ordering::Relaxed);
+
+        for ct in cts.iter().filter(|c| c.is_managed() && c.has_tag(TEMPLATE_TAG)) {
+            let half_built = !ct.template && is_named(&ct.name, TEMPLATE_HOSTNAME);
+            let stale = ct.template && (!enabled || !ct.has_tag(&specs.template));
+            if half_built {
+                warn!("Removing unfinished template container {}", ct.vmid);
+            } else if stale {
+                match self.template_in_use(&ct.vmid, cts).await {
+                    Ok(false) => info!("Removing old template container {}", ct.vmid),
+                    Ok(true) => continue,
+                    Err(e) => {
+                        debug!("Cannot tell whether template {} is in use: {:#}", ct.vmid, e);
+                        continue;
+                    }
+                }
+            } else {
+                continue;
+            }
+            if let Err(e) = self.delete_ct(&ct.vmid).await {
+                warn!("Failed to remove container {}: {:#}", ct.vmid, e);
+            }
+        }
+
+        if !enabled {
+            *cached = None;
+            return None;
+        }
+        if let Some(t) = cts
+            .iter()
+            .filter(|c| c.template && c.is_managed() && c.has_tag(TEMPLATE_TAG) && c.has_tag(&specs.template))
+            .min_by_key(|c| c.vmid_num())
+        {
+            *cached = Some((specs.template.clone(), t.vmid.clone()));
+            return Some(t.vmid.clone());
+        }
+
+        *cached = None;
+        match self.build_template(&specs.template).await {
+            Ok(vmid) => {
+                *cached = Some((specs.template.clone(), vmid.clone()));
+                Some(vmid)
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to build the template container, unpacking {} for every sandbox instead: {:#}",
+                    self.pcfg().ostemplate,
+                    e
+                );
+                self.clones_disabled.store(true, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    /// Whether any container's root filesystem is a linked clone of template `vmid`.
+    async fn template_in_use(&self, vmid: &str, cts: &[CtInfo]) -> Result<bool> {
+        let base = format!("base-{vmid}-");
+        for ct in cts.iter().filter(|c| c.vmid != vmid) {
+            let conf = self.api.get(&self.ct_path(&ct.vmid, "/config")).await?;
+            let uses = conf
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(k, _)| *k == "rootfs" || k.starts_with("mp") || k.starts_with("unused"))
+                .filter_map(|(_, v)| v.as_str())
+                .any(|v| v.contains(&base));
+            if uses {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Unpack `ostemplate` into a new container and convert it to a template.
+    async fn build_template(&self, spec: &str) -> Result<String> {
+        let hostname = self.unique_hostname(TEMPLATE_HOSTNAME).await?;
+        info!("Building template container {} from {} for linked clones", hostname, self.pcfg().ostemplate);
+        let vmid = self
+            .create_from_ostemplate(&hostname, "agentman template: sandboxes are linked clones of it")
+            .await?;
+        let pct = &self.pcfg().pct_path;
+        let tags = format!("{AGENTMAN_TAG};{TEMPLATE_TAG};{spec}");
+        let res = async {
+            self.run_tool(pct, &["set", &vmid, "--tags", &tags]).await?;
+            self.run_tool(pct, &["template", &vmid]).await
+        }
+        .await;
+        if let Err(e) = res {
+            if let Err(e2) = self.delete_ct(&vmid).await {
+                warn!("Cleanup of container {} failed: {:#}", vmid, e2);
+            }
+            return Err(e);
+        }
+        info!("Template container {} is ready", vmid);
+        Ok(vmid)
+    }
+
+    fn is_pool_member(ct: &CtInfo, specs: &Specs) -> bool {
+        ct.is_managed()
+            && ct.has_tag(POOL_TAG)
+            && ct.has_tag(&specs.pool)
+            && !ct.template
+            && ct.status == "stopped"
+    }
+
+    /// Take a warm container for a new project and assign it. None if the pool is empty
+    /// (or off), in which case the caller provisions one now.
+    async fn claim_pool_ct(
+        &self,
+        hostname: &str,
+        github_user: &str,
+        project: &str,
+        workspace_path: &Path,
+    ) -> Option<String> {
+        if self.pcfg().warm_pool_size == 0 {
+            return None;
+        }
+        let specs = self.specs.read().await.clone()?;
+        let _pool = self.pool_lock.lock().await;
+        let mut members: Vec<CtInfo> = match self.list_cts().await {
+            Ok(cts) => cts.into_iter().filter(|c| Self::is_pool_member(c, &specs)).collect(),
+            Err(e) => {
+                warn!("Failed to list warm containers: {:#}", e);
+                return None;
+            }
+        };
+        members.sort_by_key(CtInfo::vmid_num);
+        // Refill in the background whatever happens below.
+        self.pool_notify.notify_one();
+        for ct in members {
+            match self
+                .assign(&ct.vmid, hostname, github_user, project, workspace_path)
+                .await
+            {
+                Ok(()) => {
+                    info!("Claimed warm container {} as {} for {}/{}", ct.vmid, hostname, github_user, project);
+                    return Some(ct.vmid);
+                }
+                Err(e) => {
+                    warn!("Failed to assign warm container {}, removing it: {:#}", ct.vmid, e);
+                    if let Err(e2) = self.delete_ct(&ct.vmid).await {
+                        warn!("Cleanup of container {} failed: {:#}", ct.vmid, e2);
+                    }
+                }
+            }
+        }
+        info!("Warm pool is empty, creating a container for {}/{}", github_user, project);
+        None
+    }
+
+    /// Keep the template current and the warm pool at `warm_pool_size`. Runs until the
+    /// gateway exits; a claimed container wakes it to refill.
+    pub async fn run_pool_loop(&self) {
+        let pcfg = self.pcfg();
+        if pcfg.warm_pool_size == 0 && !pcfg.linked_clones {
+            info!("Warm pool and linked clones are off");
+        }
+        loop {
+            let delay = match self.maintain_pool().await {
+                Ok(()) => Duration::from_secs(300),
+                Err(e) => {
+                    warn!("Warm pool maintenance failed: {:#}", e);
+                    Duration::from_secs(60)
+                }
+            };
+            tokio::select! {
+                _ = self.pool_notify.notified() => {}
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+    }
+
+    async fn maintain_pool(&self) -> Result<()> {
+        let specs = self.compute_specs().await?;
+        *self.specs.write().await = Some(specs.clone());
+
+        let cts = self.list_cts().await?;
+        self.ensure_template(&specs, &cts).await;
+
+        let want = self.pcfg().warm_pool_size as usize;
+        {
+            let _pool = self.pool_lock.lock().await;
+            let cts = self.list_cts().await?;
+            let mut fresh = 0;
+            let mut members: Vec<&CtInfo> = cts
+                .iter()
+                .filter(|c| c.is_managed() && c.has_tag(POOL_TAG) && !c.template)
+                .collect();
+            members.sort_by_key(|c| c.vmid_num());
+            for ct in members {
+                let reason = if !ct.has_tag(&specs.pool) {
+                    "built from an older template or settings"
+                } else if ct.status != "stopped" {
+                    "not stopped"
+                } else if fresh >= want {
+                    "more than warm_pool_size"
+                } else {
+                    fresh += 1;
+                    continue;
+                };
+                info!("Removing warm container {} ({})", ct.vmid, reason);
+                if ct.status == "running" {
+                    if let Err(e) = self.shutdown_ct(&ct.vmid, true).await {
+                        warn!("Failed to stop container {}: {:#}", ct.vmid, e);
+                    }
+                }
+                if let Err(e) = self.delete_ct(&ct.vmid).await {
+                    warn!("Failed to remove container {}: {:#}", ct.vmid, e);
+                }
+            }
+            // Clones that never got their pool tag (the gateway stopped mid-way) still carry
+            // the template's tags.
+            for ct in cts.iter().filter(|c| {
+                c.is_managed() && c.has_tag(TEMPLATE_TAG) && !c.template && is_named(&c.name, POOL_HOSTNAME)
+            }) {
+                warn!("Removing unfinished warm container {}", ct.vmid);
+                if let Err(e) = self.delete_ct(&ct.vmid).await {
+                    warn!("Failed to remove container {}: {:#}", ct.vmid, e);
+                }
+            }
+            if fresh >= want {
+                return Ok(());
+            }
+        }
+
+        loop {
+            let count = self
+                .list_cts()
+                .await?
+                .iter()
+                .filter(|c| Self::is_pool_member(c, &specs))
+                .count();
+            if count >= want {
+                return Ok(());
+            }
+            self.add_pool_ct(&specs).await?;
+        }
+    }
+
+    async fn add_pool_ct(&self, specs: &Specs) -> Result<()> {
+        let hostname = self.unique_hostname(POOL_HOSTNAME).await?;
+        let vmid = self
+            .provision_blank(&hostname, "agentman warm pool: ready for the next new project")
+            .await?;
+        let tags = format!("{AGENTMAN_TAG};{POOL_TAG};{}", specs.pool);
+        if let Err(e) = self
+            .run_tool(&self.pcfg().pct_path, &["set", &vmid, "--tags", &tags])
+            .await
+        {
+            if let Err(e2) = self.delete_ct(&vmid).await {
+                warn!("Cleanup of container {} failed: {:#}", vmid, e2);
+            }
+            return Err(e.context("Failed to tag warm container"));
+        }
+        info!("Warm container {} ({}) is ready", vmid, hostname);
+        Ok(())
     }
 
     /// Start the inner Docker daemon (as container root). Idempotent and best-effort: a failure
@@ -1192,6 +1710,47 @@ impl ProxmoxManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_and_template_names_are_exact() {
+        assert!(is_named("agentman-pool", POOL_HOSTNAME));
+        assert!(is_named("agentman-pool-3", POOL_HOSTNAME));
+        assert!(!is_named("agentman-pool-x-20261014", POOL_HOSTNAME));
+        assert!(!is_named("agentman-pool-", POOL_HOSTNAME));
+        assert!(!is_named("agentman-poolside", POOL_HOSTNAME));
+        assert!(is_named("agentman-template-1", TEMPLATE_HOSTNAME));
+    }
+
+    #[test]
+    fn spec_tag_is_a_valid_proxmox_tag() {
+        let tag = spec_tag(&Sha256::digest(b"x"));
+        assert_eq!(tag.len(), "agentman-spec-".len() + 12);
+        assert!(tag.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'));
+    }
+
+    #[test]
+    fn only_stopped_fresh_pool_members_are_claimed() {
+        let specs = Specs {
+            template: "agentman-spec-aaaaaaaaaaaa".to_string(),
+            pool: "agentman-spec-bbbbbbbbbbbb".to_string(),
+        };
+        let ct = |tags: &str, status: &str, template: u8| {
+            CtInfo::from_value(&serde_json::json!({
+                "vmid": 120, "name": "agentman-pool", "status": status, "tags": tags, "template": template
+            }))
+            .unwrap()
+        };
+        let fresh = "agentman;agentman-pool;agentman-spec-bbbbbbbbbbbb";
+        assert!(ProxmoxManager::is_pool_member(&ct(fresh, "stopped", 0), &specs));
+        assert!(!ProxmoxManager::is_pool_member(&ct(fresh, "running", 0), &specs));
+        assert!(!ProxmoxManager::is_pool_member(&ct(fresh, "stopped", 1), &specs));
+        assert!(!ProxmoxManager::is_pool_member(
+            &ct("agentman;agentman-pool;agentman-spec-cccccccccccc", "stopped", 0),
+            &specs
+        ));
+        // A workspace container (claimed: no pool tag) is never taken again.
+        assert!(!ProxmoxManager::is_pool_member(&ct("agentman;agentman-dind", "stopped", 0), &specs));
+    }
 
     #[test]
     fn hostname_is_a_dns_label() {

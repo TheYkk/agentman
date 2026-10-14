@@ -277,6 +277,13 @@ Setup:
    `container_security.memory_limit` and `cpu_limit` map to the container's memory and cores/cpulimit; without a memory limit, `default_memory_mb` (4096) is used.
 4. **Service.** Use `gateway/examples/agentman-gateway-proxmox.service` (it runs as root without the Docker-specific sandboxing, since `pct` and `lxc-attach` need it).
 
+**Fast startup.** Unpacking a multi-GB `ostemplate` takes about a minute, so the gateway avoids doing it while you wait:
+
+- **Linked clones** (`linked_clones = true`, the default): the gateway unpacks `ostemplate` once into a template container (`agentman-template`, tagged `agentman-template`) and creates sandboxes as linked clones of it with `pct clone`, which takes seconds on storage with snapshot clones (`lvmthin` such as `local-lvm`, `zfspool`, `rbd`). On other storage (e.g. a `dir` storage) the first clone fails, the gateway logs it and goes back to unpacking. When the `ostemplate` file changes (size or mtime), a new template is built and the old one is removed once no sandbox is cloned from it.
+- **Warm pool** (`warm_pool_size = 1` by default, `0` turns it off): the gateway keeps that many containers created and stopped (`agentman-pool`, tagged `agentman-pool`). A new project claims one, gets its hostname, workspace bind mount and features with one `pct set`, and starts it; the pool refills in the background. Pool containers built from an older template or other memory/CPU/network settings are replaced automatically.
+
+Both run as root through `pct`, so the API token needs no extra privileges. Only containers carrying these agentman tags are ever removed by this housekeeping.
+
 Limitations: `ssh -R` listeners bind on the Proxmox host, and there is no `host.docker.internal` alias inside LXC containers. Docker's capability/seccomp settings in `[container_security]` do not apply; LXC containers use Proxmox's AppArmor profile and user namespaces instead. Workspaces created under one runtime are not reused by the other; switching runtimes provisions a fresh container on the same workspace directory.
 
 ### Docker Inside Sandboxes
