@@ -1806,6 +1806,9 @@ mod tests {
     /// probe `ready_after`, then "running". `pane list` is empty until call `panes_after`.
     /// Bare `herdr` is the client attach and reports how many of each call it saw.
     fn fake_herdr(dir: &std::path::Path, ready_after: u32, panes_after: u32) {
+        // The script reads `pane list` with jq; a stand-in keeps the tests independent of
+        // whether jq is installed (it only needs the exit status).
+        write_script(dir, "jq", "grep -q pane_id");
         let d = dir.display();
         write_script(
             dir,

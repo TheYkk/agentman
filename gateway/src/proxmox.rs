@@ -93,6 +93,16 @@ fn workspace_tag(github_user: &str, project: &str) -> String {
     format!("agentman-ws-{hex}")
 }
 
+/// Whether a lock on one of this instance's containers can only be left over from a `pct`
+/// operation that died with the gateway: on a template (`disk`/`clone` while a clone ran) or on
+/// an unfinished template or warm container (`create`). Workspace sandboxes are never touched.
+fn stale_lock(ct: &CtInfo) -> bool {
+    if ct.lock.is_none() || !ct.has_tag(TEMPLATE_TAG) {
+        return false;
+    }
+    ct.template || is_named(&ct.name, TEMPLATE_HOSTNAME) || is_named(&ct.name, POOL_HOSTNAME)
+}
+
 /// The `agentman-gw-<id>` tag for `proxmox.instance_id`, or None for the default instance.
 fn gateway_tag(instance_id: &str) -> Result<Option<String>> {
     if instance_id.is_empty() {
@@ -524,6 +534,8 @@ struct CtInfo {
     cpus: Option<f64>,
     mem: Option<u64>,
     maxmem: Option<u64>,
+    /// Config lock (`create`, `disk`, `clone`, ...), left behind when a `pct` operation dies.
+    lock: Option<String>,
 }
 
 impl CtInfo {
@@ -549,6 +561,11 @@ impl CtInfo {
             cpus: v.get("cpus").and_then(|c| c.as_f64().or_else(|| value_u64(c).map(|n| n as f64))),
             mem: v.get("mem").and_then(value_u64),
             maxmem: v.get("maxmem").and_then(value_u64),
+            lock: v
+                .get("lock")
+                .and_then(Value::as_str)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string),
         })
     }
 
@@ -634,7 +651,7 @@ impl ProxmoxManager {
             if inner_docker { "on (LXC nesting)" } else { "off" }
         );
 
-        Ok(Self {
+        let manager = Self {
             api,
             node,
             config,
@@ -648,7 +665,47 @@ impl ProxmoxManager {
             pool_lock: tokio::sync::Mutex::new(()),
             pool_notify: Notify::new(),
             gw_tag,
-        })
+        };
+        if let Err(e) = manager.prime().await {
+            warn!("Failed to look up the template and warm containers at startup: {:#}", e);
+        }
+        Ok(manager)
+    }
+
+    /// Before the first connection: clear locks a killed gateway left on its own template and
+    /// unfinished containers, and pick up an existing template so the first new project is
+    /// cloned instead of waiting for the pool loop. Nothing else runs in this process yet, so
+    /// no lock can belong to an operation still in progress.
+    async fn prime(&self) -> Result<()> {
+        let specs = self.compute_specs().await?;
+        *self.specs.write().await = Some(specs.clone());
+
+        let cts = self.list_cts().await?;
+        for ct in cts.iter().filter(|c| self.owns(c) && c.lock.is_some()) {
+            if stale_lock(ct) {
+                warn!(
+                    "Clearing stale '{}' lock on container {} ({})",
+                    ct.lock.as_deref().unwrap_or(""),
+                    ct.vmid,
+                    ct.name
+                );
+                if let Err(e) = self.run_tool(&self.pcfg().pct_path, &["unlock", &ct.vmid]).await {
+                    warn!("Failed to unlock container {}: {:#}", ct.vmid, e);
+                }
+            }
+        }
+
+        if self.pcfg().linked_clones {
+            if let Some(t) = cts
+                .iter()
+                .filter(|c| c.template && self.owns(c) && c.has_tag(TEMPLATE_TAG) && c.has_tag(&specs.template))
+                .min_by_key(|c| c.vmid_num())
+            {
+                info!("Cloning new sandboxes from template container {}", t.vmid);
+                *self.template.lock().await = Some((specs.template.clone(), t.vmid.clone()));
+            }
+        }
+        Ok(())
     }
 
     fn pcfg(&self) -> &ProxmoxConfig {
@@ -1969,6 +2026,26 @@ mod tests {
             .map(|c| c.vmid)
             .collect();
         assert!(by_id.is_empty());
+    }
+
+    #[test]
+    fn only_leftover_locks_are_cleared() {
+        let ct = |name: &str, tags: &str, template: u8, lock: &str| {
+            CtInfo::from_value(&serde_json::json!({
+                "vmid": 120, "name": name, "status": "stopped", "tags": tags,
+                "template": template, "lock": lock
+            }))
+            .unwrap()
+        };
+        let tmpl = "agentman;agentman-template;agentman-spec-aaaaaaaaaaaa";
+        // Template locked by a clone that died, and the half-made clone (still template-tagged).
+        assert!(stale_lock(&ct("agentman-template", tmpl, 1, "disk")));
+        assert!(stale_lock(&ct("agentman-pool-2", tmpl, 0, "create")));
+        assert!(stale_lock(&ct("agentman-template", tmpl, 0, "create")));
+        // Not locked, or a workspace sandbox (even one still carrying template tags).
+        assert!(!stale_lock(&ct("agentman-template", tmpl, 1, "")));
+        assert!(!stale_lock(&ct("proj-user-20261014", tmpl, 0, "create")));
+        assert!(!stale_lock(&ct("proj-user-20261014", "agentman", 0, "backup")));
     }
 
     #[test]
