@@ -38,6 +38,28 @@ impl KeyedLocks {
     }
 }
 
+/// Receives one-line status updates while a sandbox is being created or started, so the SSH
+/// layer can show them to the user instead of sitting silent through a slow first connect.
+pub type Progress<'a> = &'a (dyn Fn(&str) + Send + Sync);
+
+/// A [`Progress`] that drops every update.
+pub fn no_progress(_: &str) {}
+
+/// Status line written before creating a new sandbox.
+pub fn creating_message(project: &str) -> String {
+    format!("agentman: creating sandbox {project} (first connect, this can take a minute)...")
+}
+
+/// Status line written before starting a stopped sandbox.
+pub fn starting_message(project: &str) -> String {
+    format!("agentman: starting sandbox {project}...")
+}
+
+/// Status line written before resuming a paused sandbox.
+pub fn resuming_message(project: &str) -> String {
+    format!("agentman: resuming sandbox {project}...")
+}
+
 /// Options for destroying a workspace (container(s) + persistent data).
 #[derive(Debug, Clone, Copy)]
 pub struct DestroyOptions {
@@ -214,10 +236,17 @@ impl Runtime {
     }
 
     /// Get or create the sandbox for (github_user, project). Returns its id.
-    pub async fn get_or_create_sandbox(&self, github_user: &str, project: &str) -> Result<String> {
+    ///
+    /// `progress` is told before any slow step (creating, starting or resuming the sandbox).
+    pub async fn get_or_create_sandbox(
+        &self,
+        github_user: &str,
+        project: &str,
+        progress: Progress<'_>,
+    ) -> Result<String> {
         match self {
-            Self::Docker(m) => m.get_or_create_container(github_user, project).await,
-            Self::Proxmox(m) => m.get_or_create_container(github_user, project).await,
+            Self::Docker(m) => m.get_or_create_container(github_user, project, progress).await,
+            Self::Proxmox(m) => m.get_or_create_container(github_user, project, progress).await,
         }
     }
 

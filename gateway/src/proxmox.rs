@@ -32,7 +32,7 @@ use crate::inner_docker::{start_dockerd_command, DOCKERD_READY_TIMEOUT_SECS};
 use crate::pty::{make_controlling_terminal, open_pty, PtyReader, PtyWriter};
 use crate::runtime::{
     KeyedLocks, DestroyOptions, DestroyResult, ExecOutput, ExecProcess, ExecSpec, Resizer, SandboxStats,
-    SandboxStatus,
+    SandboxStatus, Progress, creating_message, resuming_message, starting_message,
 };
 use crate::state::{StateManager, WorkspaceInfo};
 
@@ -595,7 +595,12 @@ impl ProxmoxManager {
     }
 
     /// Get or create a container for the given user and project. Returns the VMID.
-    pub async fn get_or_create_container(&self, github_user: &str, project: &str) -> Result<String> {
+    pub async fn get_or_create_container(
+        &self,
+        github_user: &str,
+        project: &str,
+        progress: Progress<'_>,
+    ) -> Result<String> {
         // Ensure the host workspace directory is writable by the container user (needed for Zed/VS Code bootstraps).
         let workspace_path = self.config.workspace_path(github_user, project);
         ensure_workspace_writable(&workspace_path, self.config.workspace_owner()).await?;
@@ -614,7 +619,7 @@ impl ProxmoxManager {
                 );
             } else if let Some(ref vmid) = workspace.container_id {
                 if let Some(ct) = self.find_ct(vmid).await? {
-                    self.ensure_running(&ct).await?;
+                    self.ensure_running(&ct, project, progress).await?;
                     if ct.tags.iter().any(|t| t == INNER_DOCKER_TAG) {
                         self.ensure_inner_dockerd(vmid).await;
                     }
@@ -629,7 +634,8 @@ impl ProxmoxManager {
             );
         }
 
-        self.create_container(github_user, project).await
+        progress(&creating_message(project));
+        self.create_container(github_user, project, progress).await
     }
 
     /// Record the container's environment: the image's ENV (written into the template by
@@ -678,11 +684,12 @@ impl ProxmoxManager {
         }
     }
 
-    async fn ensure_running(&self, ct: &CtInfo) -> Result<()> {
+    async fn ensure_running(&self, ct: &CtInfo, project: &str, progress: Progress<'_>) -> Result<()> {
         if ct.status == "running" {
             // A frozen container still reports "running" but attach would hang.
             if self.is_frozen(&ct.vmid).await {
                 info!("Unfreezing paused container {}", ct.vmid);
+                progress(&resuming_message(project));
                 self.run_tool(&self.lxc_tool("lxc-unfreeze"), &["-n", &ct.vmid])
                     .await?;
             }
@@ -690,6 +697,7 @@ impl ProxmoxManager {
         }
 
         info!("Starting stopped container {}", ct.vmid);
+        progress(&starting_message(project));
         let upid = self
             .api
             .post(&self.ct_path(&ct.vmid, "/status/start"), &[])
@@ -762,7 +770,12 @@ impl ProxmoxManager {
     }
 
     /// Create a new container for the given user and project.
-    async fn create_container(&self, github_user: &str, project: &str) -> Result<String> {
+    async fn create_container(
+        &self,
+        github_user: &str,
+        project: &str,
+        progress: Progress<'_>,
+    ) -> Result<String> {
         let now = Utc::now();
         let date_str = now.format("%Y%m%d").to_string();
         let hostname = self
@@ -841,6 +854,7 @@ impl ProxmoxManager {
             return Err(e.context("Failed to configure the container (bind mount/features/tags)"));
         }
 
+        progress(&starting_message(project));
         let upid = self
             .api
             .post(&self.ct_path(&vmid, "/status/start"), &[])
