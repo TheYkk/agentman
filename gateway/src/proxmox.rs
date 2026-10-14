@@ -82,6 +82,34 @@ fn is_named(name: &str, base: &str) -> bool {
     }
 }
 
+/// Tag naming the workspace a sandbox belongs to, so destroy finds it even when the state file
+/// has no (or a stale) entry for it. Hashed because tags allow only `[a-z0-9_+.-]`.
+fn workspace_tag(github_user: &str, project: &str) -> String {
+    let digest = Sha256::digest(format!("{github_user}/{project}").as_bytes());
+    let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    format!("agentman-ws-{hex}")
+}
+
+/// Containers that `destroy` removes for a workspace: the one the state file maps to it, any
+/// managed container with the state's hostname, and any container tagged with the workspace.
+fn destroy_targets(cts: &[CtInfo], ws: Option<&WorkspaceInfo>, ws_tag: &str) -> Vec<CtInfo> {
+    let mut targets: Vec<CtInfo> = cts
+        .iter()
+        .filter(|ct| {
+            let by_state = ws.is_some_and(|ws| {
+                ws.container_id.as_deref() == Some(ct.vmid.as_str())
+                    || (ct.is_managed() && ct.name == ws.container_name)
+            });
+            let by_tag = ct.is_managed() && !ct.template && ct.has_tag(ws_tag);
+            by_state || by_tag
+        })
+        .cloned()
+        .collect();
+    targets.sort_by_key(CtInfo::vmid_num);
+    targets.dedup_by(|a, b| a.vmid == b.vmid);
+    targets
+}
+
 fn spec_tag(digest: &[u8]) -> String {
     let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
     format!("agentman-spec-{hex}")
@@ -698,7 +726,44 @@ impl ProxmoxManager {
             );
         }
 
+        // The state file can lose a workspace (restored or edited by hand) while its container
+        // lives on; reuse that container instead of creating a second one.
+        if let Some(ct) = self.find_tagged_ct(github_user, project).await? {
+            warn!(
+                "Reusing untracked container {} ({}) for {}/{}",
+                ct.vmid, ct.name, github_user, project
+            );
+            self.ensure_running(&ct, project, progress).await?;
+            self.state
+                .set_workspace(WorkspaceInfo {
+                    github_user: github_user.to_string(),
+                    project: project.to_string(),
+                    runtime: RuntimeKind::Proxmox,
+                    container_name: ct.name.clone(),
+                    container_id: Some(ct.vmid.clone()),
+                    created_at: Utc::now(),
+                    host_workspace_path: workspace_path,
+                })
+                .await?;
+            if ct.has_tag(INNER_DOCKER_TAG) {
+                self.ensure_inner_dockerd(&ct.vmid).await;
+            }
+            self.remember_env(&ct.vmid, github_user, project, &ct.name).await;
+            return Ok(ct.vmid);
+        }
+
         self.create_container(github_user, project, progress).await
+    }
+
+    /// The newest managed container tagged with this workspace, if any.
+    async fn find_tagged_ct(&self, github_user: &str, project: &str) -> Result<Option<CtInfo>> {
+        let tag = workspace_tag(github_user, project);
+        Ok(self
+            .list_cts()
+            .await?
+            .into_iter()
+            .filter(|c| c.is_managed() && !c.template && c.has_tag(&tag))
+            .max_by_key(CtInfo::vmid_num))
     }
 
     /// Record the container's environment: the image's ENV (written into the template by
@@ -924,10 +989,11 @@ impl ProxmoxManager {
     ) -> Result<()> {
         let description = format!("Managed by agentman for {github_user}/{project}");
         let mp0 = format!("{},mp={}", workspace_path.display(), WORKSPACE_MOUNT);
+        let ws_tag = workspace_tag(github_user, project);
         let tags = if self.inner_docker {
-            format!("{AGENTMAN_TAG};{INNER_DOCKER_TAG}")
+            format!("{AGENTMAN_TAG};{INNER_DOCKER_TAG};{ws_tag}")
         } else {
-            AGENTMAN_TAG.to_string()
+            format!("{AGENTMAN_TAG};{ws_tag}")
         };
         let mut pct_args = vec![
             "set",
@@ -1622,26 +1688,24 @@ impl ProxmoxManager {
 
         let cts = self.list_cts().await.context("Failed to list containers")?;
 
-        // Targets: the state-mapped VMID, plus any agentman-tagged container with the same hostname.
-        let mut targets: Vec<CtInfo> = Vec::new();
-        if let Some(ws) = self.state.get_workspace(github_user, project).await {
-            if ws.runtime != RuntimeKind::Proxmox {
+        let ws = self.state.get_workspace(github_user, project).await;
+        let ws = match ws {
+            Some(ws) if ws.runtime != RuntimeKind::Proxmox => {
                 warnings.push(format!(
                     "workspace belongs to the {} runtime; its container was not removed",
                     ws.runtime
                 ));
-            } else {
-                for ct in &cts {
-                    let by_id = ws.container_id.as_deref() == Some(ct.vmid.as_str());
-                    let by_name = ct.is_managed() && ct.name == ws.container_name;
-                    if by_id || by_name {
-                        targets.push(ct.clone());
-                    }
-                }
+                None
             }
+            ws => ws,
+        };
+        if ws.is_none() {
+            info!(
+                "No Proxmox state entry for {}/{}; looking for its container by tag",
+                github_user, project
+            );
         }
-        targets.sort_by(|a, b| a.vmid.cmp(&b.vmid));
-        targets.dedup_by(|a, b| a.vmid == b.vmid);
+        let targets = destroy_targets(&cts, ws.as_ref(), &workspace_tag(github_user, project));
 
         let mut removed_containers = Vec::new();
         for ct in targets {
@@ -1750,6 +1814,46 @@ mod tests {
         ));
         // A workspace container (claimed: no pool tag) is never taken again.
         assert!(!ProxmoxManager::is_pool_member(&ct("agentman;agentman-dind", "stopped", 0), &specs));
+    }
+
+    #[test]
+    fn destroy_finds_tagged_container_without_state() {
+        let ws_tag = workspace_tag("agentman-livecheck", "upgradecheck");
+        assert!(ws_tag.starts_with("agentman-ws-") && ws_tag.len() == "agentman-ws-".len() + 12);
+        assert_ne!(ws_tag, workspace_tag("agentman-livecheck", "other"));
+        let ct = |vmid: u32, name: &str, tags: String, template: u8| {
+            CtInfo::from_value(&serde_json::json!({
+                "vmid": vmid, "name": name, "status": "running", "tags": tags, "template": template
+            }))
+            .unwrap()
+        };
+        let cts = vec![
+            ct(115, "upgradecheck-agentman-livecheck-20261014", format!("agentman;agentman-dind;{ws_tag}"), 0),
+            ct(111, "proj-theykk-20261014", "agentman;agentman-dind".to_string(), 0),
+            ct(120, "agentman-pool", "agentman;agentman-pool".to_string(), 0),
+            // Same tag but not managed by agentman: never touched.
+            ct(130, "mine", ws_tag.clone(), 0),
+        ];
+
+        // No state entry (lost or never written): found by tag only.
+        let ids: Vec<String> = destroy_targets(&cts, None, &ws_tag).into_iter().map(|c| c.vmid).collect();
+        assert_eq!(ids, ["115"]);
+
+        // A state entry still finds its container by id or hostname (containers from before tags).
+        let ws = WorkspaceInfo {
+            github_user: "theykk".to_string(),
+            project: "proj".to_string(),
+            runtime: RuntimeKind::Proxmox,
+            container_name: "proj-theykk-20261014".to_string(),
+            container_id: Some("111".to_string()),
+            created_at: Utc::now(),
+            host_workspace_path: PathBuf::from("/tmp/x"),
+        };
+        let ids: Vec<String> = destroy_targets(&cts, Some(&ws), &workspace_tag("theykk", "proj"))
+            .into_iter()
+            .map(|c| c.vmid)
+            .collect();
+        assert_eq!(ids, ["111"]);
     }
 
     #[test]
