@@ -14,9 +14,17 @@ if ! command -v "$agent" >/dev/null 2>&1; then
     exit 0
 fi
 
-# Wait for the herdr server socket.
+# Wait for the herdr server. `herdr status server` exits 0 even when it is not running,
+# so read its output.
+herdr_up() {
+    case "$(herdr status server 2>/dev/null)" in
+        *"not running"*) return 1 ;;
+        *running*) return 0 ;;
+    esac
+    return 1
+}
 for _ in $(seq 1 60); do
-    if herdr status server >/dev/null 2>&1; then
+    if herdr_up; then
         break
     fi
     sleep 0.5

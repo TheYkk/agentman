@@ -23,8 +23,9 @@ if [ -n "${GITHUB_USERNAME:-}" ]; then
     }
 fi
 
-# Start SSH server in the background
-if [ -f /etc/ssh/sshd_config ]; then
+# Start SSH server in the background. Not under systemd (the Proxmox LXC template), where
+# the distro's ssh.service already runs sshd on port 22.
+if [ -f /etc/ssh/sshd_config ] && [ ! -d /run/systemd/system ]; then
     # Ensure SSH directory exists and has correct permissions
     mkdir -p ~/.ssh
     chmod 700 ~/.ssh
