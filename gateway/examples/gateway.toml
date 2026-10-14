@@ -144,6 +144,9 @@ warm_pool_size = 1
 # Unpack ostemplate once into a template container and linked-clone sandboxes from it
 # (needs lvmthin/zfspool/rbd storage; falls back to unpacking elsewhere).
 linked_clones = true
+# Only set when another gateway shares this pool: this one then manages only containers
+# tagged agentman-gw-<instance_id> (lowercase letters, digits, - and _).
+# instance_id = "test"
 
 [docker_in_sandbox]
 # Give each sandbox its own Docker daemon so `docker build` / `docker run` work inside it.
