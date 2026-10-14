@@ -98,6 +98,215 @@ pub struct GatewayConfig {
     /// Container security configuration
     #[serde(default)]
     pub container_security: ContainerSecurityConfig,
+
+    /// Running Docker inside each sandbox container
+    #[serde(default)]
+    pub docker_in_sandbox: DockerInSandboxConfig,
+
+    /// Which runtime provisions sandboxes: Docker containers or Proxmox LXC containers.
+    #[serde(default)]
+    pub runtime: RuntimeKind,
+
+    /// Proxmox VE settings (used when `runtime = "proxmox"`).
+    #[serde(default)]
+    pub proxmox: ProxmoxConfig,
+}
+
+/// Sandbox runtime backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeKind {
+    /// Docker containers via the local Docker daemon.
+    #[default]
+    Docker,
+    /// LXC containers on a Proxmox VE node.
+    Proxmox,
+}
+
+impl std::fmt::Display for RuntimeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Docker => f.write_str("docker"),
+            Self::Proxmox => f.write_str("proxmox"),
+        }
+    }
+}
+
+/// Proxmox VE (LXC) runtime configuration.
+///
+/// The gateway must run as root on the Proxmox node that hosts the containers: lifecycle
+/// operations go through the Proxmox VE API, while shells are attached with `lxc-attach`,
+/// pause/resume use `lxc-freeze`/`lxc-unfreeze`, and the workspace bind mount is configured
+/// with `pct` (Proxmox only lets `root@pam` configure bind mounts, which API tokens cannot do).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProxmoxConfig {
+    /// Base URL of the Proxmox VE API (without `/api2/json`).
+    pub api_url: String,
+
+    /// Node that hosts agent containers. Empty means the local hostname.
+    pub node: String,
+
+    /// API token id, e.g. `agentman@pve!gateway`.
+    pub token_id: String,
+
+    /// File containing the API token secret. The `AGENTMAN_PROXMOX_TOKEN_SECRET`
+    /// environment variable takes precedence when set.
+    pub token_secret_file: Option<PathBuf>,
+
+    /// PEM CA certificate used to verify the API's TLS certificate.
+    /// Defaults to the cluster CA that every Proxmox node has.
+    pub ca_cert: Option<PathBuf>,
+
+    /// Skip TLS verification of the API (only for testing).
+    pub insecure_skip_tls_verify: bool,
+
+    /// Container template volume, e.g. `local:vztmpl/agentman-base.tar.zst`.
+    /// On Proxmox VE 9.1+ this can also be an OCI image archive.
+    pub ostemplate: String,
+
+    /// Optional `ostype` for the container. Leave unset to let Proxmox detect it from the
+    /// template; `unmanaged` stops Proxmox from writing network/hostname config inside
+    /// (useful when the template's distro is newer than the node supports).
+    pub ostype: Option<String>,
+
+    /// Storage for the container root filesystem.
+    pub storage: String,
+
+    /// Root filesystem size in GiB.
+    pub rootfs_size_gb: u32,
+
+    /// Memory in MiB when `container_security.memory_limit` is not set.
+    pub default_memory_mb: u64,
+
+    /// Swap in MiB.
+    pub swap_mb: u64,
+
+    /// Network bridge for `net0`.
+    pub bridge: String,
+
+    /// IPv4 config for `net0` (`dhcp` or CIDR like `10.0.0.5/24`).
+    pub ip: String,
+
+    /// Optional IPv4 gateway for `net0` (when `ip` is static).
+    pub gateway: Option<String>,
+
+    /// Optional resource pool to place containers in.
+    pub pool: Option<String>,
+
+    /// Create unprivileged containers (recommended).
+    pub unprivileged: bool,
+
+    /// Enable the `nesting` feature (needed by systemd in recent distros and by docker-in-LXC).
+    pub nesting: bool,
+
+    /// Enable the `keyctl` feature on unprivileged containers when Docker runs inside
+    /// (`docker_in_sandbox.mode` other than `off`).
+    pub keyctl: bool,
+
+    /// Enable the `fuse` feature (for fuse-overlayfs or other FUSE filesystems inside).
+    pub fuse: bool,
+
+    /// Host UID/GID offset for unprivileged containers (Proxmox default: 100000).
+    pub id_map_offset: u32,
+
+    /// UID that shells run as inside the container.
+    pub exec_uid: u32,
+
+    /// GID that shells run as inside the container.
+    pub exec_gid: u32,
+
+    /// Give shells the exec user's supplementary groups from the container's `/etc/group`
+    /// (e.g. `docker`, so the user can reach the Docker socket). Requires `setpriv` and a
+    /// user with `exec_uid` inside the container.
+    pub exec_init_groups: bool,
+
+    /// Base environment for shells inside the container (`lxc-attach` starts from a clean env).
+    pub exec_env: Vec<String>,
+
+    /// Directory with the LXC tools (`lxc-attach`, `lxc-info`, `lxc-freeze`, `lxc-unfreeze`).
+    pub lxc_bin_dir: PathBuf,
+
+    /// Path to `pct`.
+    pub pct_path: PathBuf,
+}
+
+impl Default for ProxmoxConfig {
+    fn default() -> Self {
+        Self {
+            api_url: "https://127.0.0.1:8006".to_string(),
+            node: String::new(),
+            token_id: "agentman@pve!gateway".to_string(),
+            token_secret_file: Some(PathBuf::from("/etc/agentman/proxmox-token")),
+            ca_cert: Some(PathBuf::from("/etc/pve/pve-root-ca.pem")),
+            insecure_skip_tls_verify: false,
+            ostemplate: "local:vztmpl/agentman-base.tar".to_string(),
+            ostype: None,
+            storage: "local-lvm".to_string(),
+            rootfs_size_gb: 16,
+            default_memory_mb: 4096,
+            swap_mb: 512,
+            bridge: "vmbr0".to_string(),
+            ip: "dhcp".to_string(),
+            gateway: None,
+            pool: None,
+            unprivileged: true,
+            nesting: true,
+            keyctl: true,
+            fuse: false,
+            id_map_offset: 100_000,
+            // Matches the user baked into the base image (see Dockerfile: USERNAME/USER_UID/USER_GID).
+            exec_uid: 1000,
+            exec_gid: 1000,
+            exec_init_groups: true,
+            exec_env: vec![
+                "HOME=/home/agent".to_string(),
+                "SHELL=/bin/bash".to_string(),
+                "USER=agent".to_string(),
+                "LOGNAME=agent".to_string(),
+                "LANG=C.UTF-8".to_string(),
+                "BUN_INSTALL=/usr/local/bun".to_string(),
+                "GOPATH=/home/agent/go".to_string(),
+                "JAVA_HOME=/home/agent/.sdkman/candidates/java/current".to_string(),
+                "PATH=/home/agent/.cargo/bin:/home/agent/.local/bin:/home/agent/.local/share/mise/shims:/home/agent/go/bin:/usr/local/go/bin:/usr/local/bun/bin:/usr/local/node/bin:/home/agent/.sdkman/candidates/java/current/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+            ],
+            lxc_bin_dir: PathBuf::from("/usr/bin"),
+            pct_path: PathBuf::from("/usr/sbin/pct"),
+        }
+    }
+}
+
+impl ProxmoxConfig {
+    /// Value for the container's `features` option, if any feature is enabled.
+    /// `inner_docker` is whether the sandbox runs its own Docker daemon (which needs keyctl).
+    pub fn features(&self, inner_docker: bool) -> Option<String> {
+        let mut features = Vec::new();
+        if self.nesting {
+            features.push("nesting=1");
+        }
+        // keyctl only exists for unprivileged containers, and only Docker needs it.
+        if self.keyctl && self.unprivileged && inner_docker {
+            features.push("keyctl=1");
+        }
+        if self.fuse {
+            features.push("fuse=1");
+        }
+        (!features.is_empty()).then(|| features.join(","))
+    }
+
+    /// UID/GID on the host that maps to the container's exec user.
+    ///
+    /// Used to make bind-mounted workspaces and sockets writable from inside the container.
+    pub fn host_owner(&self) -> (u32, u32) {
+        if self.unprivileged {
+            (
+                self.id_map_offset + self.exec_uid,
+                self.id_map_offset + self.exec_gid,
+            )
+        } else {
+            (self.exec_uid, self.exec_gid)
+        }
+    }
 }
 
 impl Default for GatewayConfig {
@@ -117,6 +326,9 @@ impl Default for GatewayConfig {
             agent_forwarding: AgentForwardingConfig::default(),
             shell: ShellConfig::default(),
             container_security: ContainerSecurityConfig::default(),
+            docker_in_sandbox: DockerInSandboxConfig::default(),
+            runtime: RuntimeKind::default(),
+            proxmox: ProxmoxConfig::default(),
         }
     }
 }
@@ -197,6 +409,73 @@ impl Default for ContainerSecurityConfig {
     }
 }
 
+/// Whether each sandbox gets its own Docker daemon. Shared by every sandbox backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DockerInSandboxMode {
+    /// Enable when the backend can isolate it without extra privileges: the Docker backend
+    /// needs the sysbox runtime, an LXC backend needs an unprivileged container with nesting.
+    Auto,
+    /// Always enable. The Docker backend uses `docker_isolation`; startup fails if that
+    /// isolation is unavailable.
+    On,
+    /// No Docker daemon inside sandboxes.
+    Off,
+}
+
+impl Default for DockerInSandboxMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+/// How the Docker backend isolates a sandbox that runs its own Docker daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DockerIsolation {
+    /// Run under the sysbox runtime (user-namespaced, no `--privileged`).
+    Sysbox,
+    /// Run with `--privileged`. Root in the sandbox is effectively root on the host;
+    /// only use this for fully trusted users.
+    Privileged,
+}
+
+impl Default for DockerIsolation {
+    fn default() -> Self {
+        Self::Sysbox
+    }
+}
+
+/// Docker-in-sandbox configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DockerInSandboxConfig {
+    /// Whether sandboxes run their own Docker daemon (see [`DockerInSandboxMode`]).
+    pub mode: DockerInSandboxMode,
+
+    /// Docker backend only: isolation used when the mode is `on`.
+    pub docker_isolation: DockerIsolation,
+
+    /// Docker backend only: name of the sysbox runtime registered with the host Docker daemon.
+    pub sysbox_runtime: String,
+
+    /// Docker backend only: keep the inner Docker data (`/var/lib/docker`: images, build cache,
+    /// volumes) in a per-workspace named volume so it survives container recreation.
+    /// LXC sandboxes keep it in their persistent root filesystem.
+    pub persist_data: bool,
+}
+
+impl Default for DockerInSandboxConfig {
+    fn default() -> Self {
+        Self {
+            mode: DockerInSandboxMode::Auto,
+            docker_isolation: DockerIsolation::Sysbox,
+            sysbox_runtime: "sysbox-runc".to_string(),
+            persist_data: true,
+        }
+    }
+}
+
 impl GatewayConfig {
     /// Load configuration from a TOML file.
     pub fn load(path: &Path) -> Result<Self> {
@@ -248,8 +527,66 @@ impl GatewayConfig {
         Ok(())
     }
 
+    /// UID/GID on the host that should own workspace directories and forwarded sockets.
+    pub fn workspace_owner(&self) -> (u32, u32) {
+        match self.runtime {
+            // Matches the default user baked into the base image (see Dockerfile: USER_UID/USER_GID).
+            RuntimeKind::Docker => (1000, 1000),
+            RuntimeKind::Proxmox => self.proxmox.host_owner(),
+        }
+    }
+
     /// Get the workspace path for a given GitHub user and project.
     pub fn workspace_path(&self, github_user: &str, project: &str) -> PathBuf {
         self.workspace_root.join(github_user).join(project)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn example_config_parses() {
+        let content = include_str!("../examples/gateway.toml");
+        let config: GatewayConfig = toml::from_str(content).unwrap();
+        assert_eq!(config.runtime, RuntimeKind::Docker);
+        assert_eq!(config.workspace_owner(), (1000, 1000));
+        assert_eq!(config.proxmox.token_id, "agentman@pve!gateway");
+    }
+
+    #[test]
+    fn proxmox_runtime_shifts_workspace_owner() {
+        let config: GatewayConfig = toml::from_str("runtime = \"proxmox\"\n").unwrap();
+        assert_eq!(config.runtime, RuntimeKind::Proxmox);
+        assert_eq!(config.workspace_owner(), (101000, 101000));
+    }
+
+    #[test]
+    fn docker_in_sandbox_defaults_to_auto() {
+        let config: GatewayConfig = toml::from_str("").unwrap();
+        assert_eq!(config.docker_in_sandbox.mode, DockerInSandboxMode::Auto);
+        assert_eq!(config.docker_in_sandbox.docker_isolation, DockerIsolation::Sysbox);
+        assert_eq!(config.docker_in_sandbox.sysbox_runtime, "sysbox-runc");
+        assert!(config.docker_in_sandbox.persist_data);
+    }
+
+    #[test]
+    fn docker_in_sandbox_parses_modes() {
+        for (raw, mode) in [
+            ("auto", DockerInSandboxMode::Auto),
+            ("off", DockerInSandboxMode::Off),
+            ("on", DockerInSandboxMode::On),
+        ] {
+            let config: GatewayConfig =
+                toml::from_str(&format!("[docker_in_sandbox]\nmode = \"{raw}\"\n")).unwrap();
+            assert_eq!(config.docker_in_sandbox.mode, mode);
+        }
+
+        let config: GatewayConfig = toml::from_str(
+            "[docker_in_sandbox]\nmode = \"on\"\ndocker_isolation = \"privileged\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.docker_in_sandbox.docker_isolation, DockerIsolation::Privileged);
     }
 }

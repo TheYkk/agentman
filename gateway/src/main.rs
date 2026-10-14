@@ -1,12 +1,17 @@
 //! Agentman SSH Gateway
 //!
 //! A Rust SSH server that authenticates users via GitHub SSH keys,
-//! manages Docker containers per project, and supports port forwarding.
+//! manages a sandbox per project (Docker containers or Proxmox LXC containers),
+//! and supports port forwarding.
 
 mod config;
 mod docker;
 mod gateway_control;
+mod inner_docker;
 mod github;
+mod proxmox;
+mod pty;
+mod runtime;
 mod ssh;
 mod state;
 
@@ -17,12 +22,14 @@ use std::sync::Arc;
 use tracing::{info, Level};
 use tracing_subscriber::EnvFilter;
 
-use crate::config::GatewayConfig;
+use crate::config::{GatewayConfig, RuntimeKind};
 use crate::docker::ContainerManager;
 use crate::github::GitHubKeyFetcher;
+use crate::proxmox::ProxmoxManager;
+use crate::runtime::Runtime;
 use crate::state::StateManager;
 
-/// Agentman SSH Gateway - manages agent containers via SSH
+/// Agentman SSH Gateway - manages agent containers (Docker or Proxmox LXC) via SSH
 #[derive(Parser, Debug)]
 #[command(name = "agentman-gateway", version, about)]
 struct Cli {
@@ -82,7 +89,11 @@ async fn main() -> Result<()> {
 
     info!("Starting agentman-gateway");
     info!("  Listen address: {}", config.listen_addr);
-    info!("  Docker image: {}", config.docker_image);
+    info!("  Runtime: {}", config.runtime);
+    match config.runtime {
+        RuntimeKind::Docker => info!("  Docker image: {}", config.docker_image),
+        RuntimeKind::Proxmox => info!("  LXC template: {}", config.proxmox.ostemplate),
+    }
     info!("  Workspace root: {}", config.workspace_root.display());
 
     let config = Arc::new(config);
@@ -99,15 +110,22 @@ async fn main() -> Result<()> {
     // Initialize GitHub key fetcher
     let github_fetcher = Arc::new(GitHubKeyFetcher::new());
 
-    // Initialize Docker container manager
-    let container_manager = Arc::new(
-        ContainerManager::new(config.clone(), state.clone())
-            .await
-            .context("Failed to initialize Docker container manager")?,
-    );
+    // Initialize the sandbox runtime
+    let runtime = Arc::new(match config.runtime {
+        RuntimeKind::Docker => Runtime::Docker(
+            ContainerManager::new(config.clone(), state.clone())
+                .await
+                .context("Failed to initialize Docker container manager")?,
+        ),
+        RuntimeKind::Proxmox => Runtime::Proxmox(
+            ProxmoxManager::new(config.clone(), state.clone())
+                .await
+                .context("Failed to initialize Proxmox LXC manager")?,
+        ),
+    });
 
     // Run SSH server
-    ssh::run_server(config, state, container_manager, github_fetcher).await?;
+    ssh::run_server(config, state, runtime, github_fetcher).await?;
 
     Ok(())
 }

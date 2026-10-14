@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::sync::RwLock;
 
+use crate::config::RuntimeKind;
+
 /// Persistent gateway state.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct GatewayState {
@@ -46,10 +48,14 @@ pub struct WorkspaceInfo {
     /// Project name.
     pub project: String,
 
-    /// Docker container name.
+    /// Runtime that owns the sandbox. Older state files predate this field and are Docker.
+    #[serde(default)]
+    pub runtime: RuntimeKind,
+
+    /// Container name (Docker container name, or LXC hostname on Proxmox).
     pub container_name: String,
 
-    /// Docker container ID (if running).
+    /// Container ID (Docker container ID, or LXC VMID on Proxmox).
     pub container_id: Option<String>,
 
     /// When the container was created.

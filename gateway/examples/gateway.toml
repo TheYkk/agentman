@@ -4,6 +4,10 @@
 # SSH server listen address
 listen_addr = "0.0.0.0:2222"
 
+# Sandbox runtime: "docker" (default) or "proxmox" (LXC containers on Proxmox VE).
+# See the [proxmox] section at the end of this file.
+runtime = "docker"
+
 # Docker image to use for agent containers
 docker_image = "agentman-base:dev"
 
@@ -75,3 +79,90 @@ readonly_rootfs = false
 
 # Use default seccomp profile
 use_seccomp = true
+
+[proxmox]
+# Only used when runtime = "proxmox". The gateway must run as root on the Proxmox node.
+api_url = "https://127.0.0.1:8006"
+# Node hosting the containers (empty = this machine's hostname)
+node = ""
+token_id = "agentman@pve!gateway"
+# Token secret file (or set AGENTMAN_PROXMOX_TOKEN_SECRET)
+token_secret_file = "/etc/agentman/proxmox-token"
+# CA used to verify the API certificate (the cluster CA exists on every node)
+ca_cert = "/etc/pve/pve-root-ca.pem"
+insecure_skip_tls_verify = false
+
+# Container template (on PVE 9.1+ this can be an OCI image pulled into vztmpl storage)
+ostemplate = "local:vztmpl/agentman-base_latest.tar"
+# ostype = "unmanaged"   # if Proxmox does not recognize the template's distro version
+storage = "local-lvm"
+rootfs_size_gb = 16
+# Used when container_security.memory_limit is not set
+default_memory_mb = 4096
+swap_mb = 512
+bridge = "vmbr0"
+ip = "dhcp"
+# gateway = "10.0.0.1"   # with a static ip
+# Resource pool to create containers in. Needed when the API token is scoped to a pool
+# (see README); otherwise the token needs VM.Allocate on /vms/<id>.
+# pool = "agentman"
+
+unprivileged = true
+# nesting (systemd, Docker) and keyctl (Docker; only set when docker_in_sandbox.mode != "off").
+# fuse is optional.
+nesting = true
+keyctl = true
+fuse = false
+# Host UID/GID offset of unprivileged containers (workspaces are chowned to offset + exec_uid)
+id_map_offset = 100000
+
+# User that shells run as inside the container
+exec_uid = 1000
+exec_gid = 1000
+# Keep the user's supplementary groups (e.g. docker) via setpriv inside the container
+exec_init_groups = true
+# lxc-attach starts from a clean environment. Sessions get these, overridden by the image's ENV
+# that scripts/build-lxc-template.sh writes to /etc/agentman/image.env in the template.
+exec_env = [
+    "HOME=/home/agent",
+    "SHELL=/bin/bash",
+    "USER=agent",
+    "LOGNAME=agent",
+    "LANG=C.UTF-8",
+    "BUN_INSTALL=/usr/local/bun",
+    "GOPATH=/home/agent/go",
+    "JAVA_HOME=/home/agent/.sdkman/candidates/java/current",
+    "PATH=/home/agent/.cargo/bin:/home/agent/.local/bin:/home/agent/.local/share/mise/shims:/home/agent/go/bin:/usr/local/go/bin:/usr/local/bun/bin:/usr/local/node/bin:/home/agent/.sdkman/candidates/java/current/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+]
+
+lxc_bin_dir = "/usr/bin"
+pct_path = "/usr/sbin/pct"
+
+[docker_in_sandbox]
+# Give each sandbox its own Docker daemon so `docker build` / `docker run` work inside it.
+# This section is shared by all sandbox backends.
+#   "auto" - enable only where it is isolated without extra privileges (default):
+#            Docker backend: when the host Docker daemon has the sysbox runtime
+#            LXC backend: unprivileged containers with nesting
+#   "on"   - always enable; the Docker backend uses docker_isolation below and the gateway
+#            refuses to start if that isolation is unavailable
+#   "off"  - no Docker inside sandboxes
+# The gateway starts dockerd as root inside the sandbox on create and on every reconnect
+# (log: /var/log/dockerd.log); the socket belongs to the sandbox user's group.
+# A mode change applies to newly created sandboxes; destroy and reconnect to switch an existing one.
+mode = "auto"
+
+# Docker backend only: isolation used when mode = "on".
+#   "sysbox"     - sysbox runtime (https://github.com/nestybox/sysbox): the sandbox runs in a user
+#                  namespace, so the inner dockerd gets its capabilities without host root
+#   "privileged" - --privileged; sandbox root is host root, trusted users only
+# The container_security cap_drop/cap_add settings are not applied while Docker-in-sandbox is on.
+docker_isolation = "sysbox"
+
+# Docker backend only: runtime name sysbox is registered under in /etc/docker/daemon.json
+sysbox_runtime = "sysbox-runc"
+
+# Docker backend only: keep inner images, build cache and volumes in a per-workspace named volume
+# (agentman-docker-<github_user>-<project>) so they survive container recreation.
+# The volume is deleted with the workspace on destroy.
+persist_data = true
