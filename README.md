@@ -47,7 +47,7 @@ The **agentman-gateway** is a Rust SSH server that provides streamlined access t
    # After first auth, just use the project name
    ssh myproject@agent-server
    ```
-  Tip: interactive sessions (PTY) attach to `tmux` by default — detach with `Ctrl-b d`, then reconnect to resume. Non-interactive SSH commands (editor bootstrap) are not wrapped in tmux.
+  Tip: interactive sessions (PTY) attach to the sandbox's `herdr` server, where opencode is already open. Detach with `ctrl+b q`, then reconnect to resume. Non-interactive SSH commands (editor bootstrap) run directly, not inside herdr.
 
 3. **Add to ~/.ssh/config** for convenience:
    ```
@@ -81,7 +81,7 @@ The **agentman-gateway** is a Rust SSH server that provides streamlined access t
 2. **Key Verification**: Gateway checks your SSH public key against GitHub's API
 3. **Container Provisioning**: Creates/starts a container named `project-github-YYYYMMDD`
 4. **Workspace Persistence**: Bind-mounts `/var/lib/agentman/workspaces/<github>/<project>` to `/workspace`
-5. **Session**: Your interactive shell runs inside the container via Docker exec (attached to a persistent `tmux` session by default when a PTY is requested)
+5. **Session**: Your interactive shell runs inside the container via Docker exec (attached to the sandbox's persistent `herdr` session when a PTY is requested)
 
 ### Authentication Flow
 
@@ -93,7 +93,7 @@ ssh myproject+octocat@gateway
 ```
 The `+octocat` tells the gateway your GitHub username. It verifies your SSH key is in `github.com/octocat.keys` and caches the mapping.
 
-Note: editor integrations typically run non-PTY SSH exec probes (e.g. `ssh -T host "cd; uname -sm"`). The gateway does **not** wrap these in tmux and returns a proper SSH exit status so editors can bootstrap reliably.
+Note: editor integrations typically run non-PTY SSH exec probes (e.g. `ssh -T host "cd; uname -sm"`). The gateway does **not** wrap these in herdr and returns a proper SSH exit status so editors can bootstrap reliably.
 
 **Interactive (first time from terminal)**:
 ```bash
@@ -182,8 +182,7 @@ host_key_path = "/var/lib/agentman/host_key"
 bootstrap_github_users = ["octocat", "defunkt"]
 
 [shell]
-mode = "tmux"
-tmux_session = "agentman"
+mode = "herdr"          # "herdr" (attach to herdr on PTY sessions) or "bash"
 
 [port_forwarding]
 allow_local = true      # Allow -L (local port forward)
@@ -221,7 +220,7 @@ The `/workspace` bind-mount is the only host path exposed to containers.
 
 ### Running on Proxmox VE (LXC)
 
-Instead of Docker, the gateway can run each sandbox as an **LXC container on Proxmox VE**. Set `runtime = "proxmox"` and fill in the `[proxmox]` section. Everything else (SSH auth, tmux sessions, port/agent forwarding, `agentman list/stop/pause/stats/destroy`) works the same.
+Instead of Docker, the gateway can run each sandbox as an **LXC container on Proxmox VE**. Set `runtime = "proxmox"` and fill in the `[proxmox]` section. Everything else (SSH auth, herdr sessions, port/agent forwarding, `agentman list/stop/pause/stats/destroy`) works the same.
 
 How it works:
 - The gateway runs **as root on the Proxmox node** that hosts the containers.
@@ -242,7 +241,7 @@ Setup:
      ```
      and set `ostemplate = "local:vztmpl/agentman-base.tar.zst"`. If the node rejects the template's Debian version, set `ostype = "unmanaged"`; the template then configures `eth0` with DHCP itself.
    - *Proxmox VE 9.1+:* you can instead pull the image as an OCI template (Datacenter → Storage → CT Templates → *Pull from OCI Registry*, e.g. `ghcr.io/theykk/agentman-base:latest`) and set `ostemplate` to the resulting volume. A plain `docker export` without an init does not boot on any version.
-   - Any other LXC template works as long as it has a user with UID 1000 and the tools you need (`bash`, `tmux`, `socat` for `ssh -L`, `setpriv`, and `dockerd` for Docker inside).
+   - Any other LXC template works as long as it has a user with UID 1000 and the tools you need (`bash`, `herdr` (or the shell falls back to `bash -l`), `socat` for `ssh -L`, `setpriv`, and `dockerd` for Docker inside).
 2. **API token.** Give a dedicated user exactly what container management needs, scoped to a resource pool. New containers are created *into* the pool, so the token never needs rights on individual `/vms/<id>` paths and any free VMID works:
    ```bash
    pveum pool add agentman
