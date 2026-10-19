@@ -8,7 +8,7 @@ variable "IMAGE_TAG"     { default = "dev" }
 variable "PLATFORMS"     { default = "linux/amd64" }
 
 variable "DEBIAN_TAG"    { default = "trixie-slim" }
-variable "MISE_VERSION"     { default = "2026.10.13" }
+variable "MISE_VERSION"     { default = "2026.10.14" }
 variable "HERDR_VERSION"    { default = "0.9.5" }
 variable "RUSTUP_VERSION"   { default = "1.29.1" }
 variable "RUST_TOOLCHAIN"   { default = "1.99.1" }
@@ -23,7 +23,7 @@ variable "DUCKDB_VERSION" { default = "1.5.6" }
 variable "OPENCODE_VERSION" { default = "2.0.32" }
 variable "CLAUDE_CLI_VERSION"  { default = "2.1.302" }
 variable "PI_VERSION"       { default = "1.3.0" }
-variable "OMP_VERSION"      { default = "18.11.3" }
+variable "OMP_VERSION"      { default = "18.12.1" }
 variable "CLOUDFLARED_VERSION" { default = "2026.10.1" }
 variable "GH_VERSION"       { default = "2.102.0" }
 variable "CADDY_VERSION"    { default = "2.11.7" }
