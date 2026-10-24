@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
@@ -58,6 +58,16 @@ pub fn starting_message(project: &str) -> String {
 /// Status line written before resuming a paused sandbox.
 pub fn resuming_message(project: &str) -> String {
     format!("agentman: resuming sandbox {project}...")
+}
+
+/// Run `fut` in its own task and wait for it. Dropping the returned future (an aborted caller)
+/// detaches the task instead of cancelling `fut`.
+pub async fn run_detached<T: Send + 'static>(
+    fut: impl std::future::Future<Output = Result<T>> + Send + 'static,
+) -> Result<T> {
+    tokio::spawn(fut)
+        .await
+        .map_err(|e| anyhow!("sandbox provisioning task failed: {e}"))?
 }
 
 /// Options for destroying a workspace (container(s) + persistent data).
@@ -262,6 +272,26 @@ impl Runtime {
         }
     }
 
+    /// [`Self::get_or_create_sandbox`] in its own task, so it runs to completion even when the
+    /// caller is cancelled (the client closes the channel or disconnects mid-create). Otherwise
+    /// a sandbox could be claimed or created and started but never recorded in the state file,
+    /// leaving a container that `destroy` cannot find.
+    pub async fn ensure_sandbox(
+        self: &Arc<Self>,
+        github_user: &str,
+        project: &str,
+        progress: impl Fn(&str) + Send + Sync + 'static,
+    ) -> Result<String> {
+        let rt = self.clone();
+        let github_user = github_user.to_string();
+        let project = project.to_string();
+        run_detached(async move {
+            rt.get_or_create_sandbox(&github_user, &project, &progress)
+                .await
+        })
+        .await
+    }
+
     /// Start a process inside a sandbox (by id) with its I/O attached.
     pub async fn exec(&self, sandbox_id: &str, spec: ExecSpec) -> Result<ExecProcess> {
         match self {
@@ -333,5 +363,30 @@ impl Runtime {
             Self::Docker(m) => m.stats(&ws.container_name, fast).await,
             Self::Proxmox(m) => m.stats(ws).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn detached_work_survives_an_aborted_caller() {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let caller = tokio::spawn(run_detached(async move {
+            // Like claiming a warm container, starting it and then writing the state file.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = done_tx.send(());
+            Ok(())
+        }));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // The SSH channel closes mid-create: the session aborts its I/O task.
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), done_rx)
+            .await
+            .expect("provisioning was cancelled with its caller")
+            .unwrap();
     }
 }

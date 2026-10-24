@@ -227,6 +227,13 @@ pub struct ProxmoxConfig {
     /// clones of it, which takes seconds instead of a minute. Needs storage with snapshot
     /// clones (lvmthin, zfspool, rbd); elsewhere the gateway falls back to unpacking.
     pub linked_clones: bool,
+
+    /// Name of this gateway when several share a Proxmox pool (e.g. a test gateway next to a
+    /// permanent one). Its containers are tagged `agentman-gw-<instance_id>` and it only ever
+    /// claims, reuses, cleans up or destroys containers with its own tag. Empty (the default)
+    /// owns the containers with no `agentman-gw-*` tag, which is every container made before
+    /// this option existed. Lowercase letters, digits, `-` and `_`.
+    pub instance_id: String,
 }
 
 impl Default for ProxmoxConfig {
@@ -273,6 +280,7 @@ impl Default for ProxmoxConfig {
             pvesm_path: PathBuf::from("/usr/sbin/pvesm"),
             warm_pool_size: 1,
             linked_clones: true,
+            instance_id: String::new(),
         }
     }
 }

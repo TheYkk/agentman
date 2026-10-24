@@ -1094,7 +1094,7 @@ impl Handler for ConnectionHandler {
                 let id = match self
                     .server
                     .runtime
-                    .get_or_create_sandbox(github_user, project, &runtime::no_progress)
+                    .ensure_sandbox(github_user, project, runtime::no_progress)
                     .await
                 {
                     Ok(id) => id,
@@ -1345,7 +1345,7 @@ impl ConnectionHandler {
                     github_user,
                     project,
                 } => {
-                    match provision_with_progress(&runtime, &handle, channel_id, &github_user, &project, tty)
+                    match provision_with_progress(runtime.clone(), &handle, channel_id, &github_user, &project, tty)
                         .await
                     {
                         Ok(id) => {
@@ -1475,7 +1475,7 @@ impl ConnectionHandler {
 /// starting, ...) to the channel's stderr as they happen. Stderr keeps stdout clean for
 /// non-PTY exec sessions that use it as a transport (editor bootstraps, scp, ...).
 async fn provision_with_progress(
-    runtime: &Runtime,
+    runtime: Arc<Runtime>,
     handle: &Handle,
     channel_id: ChannelId,
     github_user: &str,
@@ -1494,11 +1494,10 @@ async fn provision_with_progress(
     let progress = move |msg: &str| {
         let _ = tx.send(status_line(msg, tty));
     };
-    let res = runtime
-        .get_or_create_sandbox(github_user, project, &progress)
-        .await;
+    // Detached: closing the channel mid-create must not leave an unrecorded sandbox. The
+    // progress sender is dropped when the provisioning task ends, which ends `forward`.
+    let res = runtime.ensure_sandbox(github_user, project, progress).await;
     // Flush every progress line before the process output starts.
-    drop(progress);
     let _ = forward.await;
     res
 }
@@ -1807,6 +1806,9 @@ mod tests {
     /// probe `ready_after`, then "running". `pane list` is empty until call `panes_after`.
     /// Bare `herdr` is the client attach and reports how many of each call it saw.
     fn fake_herdr(dir: &std::path::Path, ready_after: u32, panes_after: u32) {
+        // The script reads `pane list` with jq; a stand-in keeps the tests independent of
+        // whether jq is installed (it only needs the exit status).
+        write_script(dir, "jq", "grep -q pane_id");
         let d = dir.display();
         write_script(
             dir,

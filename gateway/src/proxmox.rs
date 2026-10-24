@@ -57,6 +57,16 @@ const POOL_TAG: &str = "agentman-pool";
 /// Tag on the template container that sandboxes are linked-cloned from.
 const TEMPLATE_TAG: &str = "agentman-template";
 
+/// Prefix of the tag naming the workspace a sandbox belongs to.
+const WORKSPACE_TAG_PREFIX: &str = "agentman-ws-";
+
+/// Prefix of the tag naming the template a linked clone was made from. Linked clones cannot be
+/// told apart by their config on every storage (lvmthin shows only `vm-<id>-disk-0`).
+const FROM_TAG_PREFIX: &str = "agentman-from-";
+
+/// Prefix of the tag naming the gateway instance that owns a container.
+const GATEWAY_TAG_PREFIX: &str = "agentman-gw-";
+
 /// Hostnames (prefixes) of warm-pool and template containers.
 const POOL_HOSTNAME: &str = "agentman-pool";
 const TEMPLATE_HOSTNAME: &str = "agentman-template";
@@ -80,6 +90,129 @@ fn is_named(name: &str, base: &str) -> bool {
             .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
         None => false,
     }
+}
+
+/// Tag naming the workspace a sandbox belongs to, so destroy finds it even when the state file
+/// has no (or a stale) entry for it. Hashed because tags allow only `[a-z0-9_+.-]`.
+fn workspace_tag(github_user: &str, project: &str) -> String {
+    let digest = Sha256::digest(format!("{github_user}/{project}").as_bytes());
+    let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    format!("{WORKSPACE_TAG_PREFIX}{hex}")
+}
+
+/// Whether a lock on one of this instance's containers can only be left over from a `pct`
+/// operation that died with the gateway: on a template (`disk`/`clone` while a clone ran) or on
+/// an unfinished template or warm container (`create`). Workspace sandboxes are never touched.
+fn stale_lock(ct: &CtInfo) -> bool {
+    ct.lock.is_some() && ((ct.template && ct.has_tag(TEMPLATE_TAG)) || unfinished(ct))
+}
+
+/// A template or warm container the gateway stopped building half-way: named like one, not
+/// (yet) a template, and never finished as a warm container (`agentman-pool` tag) or handed to
+/// a workspace (`agentman-ws-*` tag). Depending on where it stopped, a clone still carries the
+/// template's tags or already just the base tags. Callers check ownership.
+fn unfinished(ct: &CtInfo) -> bool {
+    !ct.template
+        && (is_named(&ct.name, POOL_HOSTNAME) || is_named(&ct.name, TEMPLATE_HOSTNAME))
+        && !ct.has_tag(POOL_TAG)
+        && !ct.tags.iter().any(|t| t.starts_with(WORKSPACE_TAG_PREFIX))
+}
+
+/// The `agentman-gw-<id>` tag for `proxmox.instance_id`, or None for the default instance.
+fn gateway_tag(instance_id: &str) -> Result<Option<String>> {
+    if instance_id.is_empty() {
+        return Ok(None);
+    }
+    if !instance_id
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    {
+        bail!("proxmox.instance_id {instance_id:?} may only contain a-z, 0-9, '-' and '_'");
+    }
+    Ok(Some(format!("{GATEWAY_TAG_PREFIX}{instance_id}")))
+}
+
+/// Whether this gateway instance manages `ct`: it carries the agentman tag and this instance's
+/// gateway tag, or no gateway tag at all for the default instance.
+fn owned(ct: &CtInfo, gw_tag: Option<&str>) -> bool {
+    ct.is_managed()
+        && match gw_tag {
+            Some(tag) => ct.has_tag(tag),
+            None => !ct.tags.iter().any(|t| t.starts_with(GATEWAY_TAG_PREFIX)),
+        }
+}
+
+/// Containers that `destroy` removes for a workspace: the one the state file maps to it, any
+/// container with the state's hostname, and any container tagged with the workspace, as long
+/// as this gateway instance owns them.
+fn destroy_targets(
+    cts: &[CtInfo],
+    ws: Option<&WorkspaceInfo>,
+    ws_tag: &str,
+    gw_tag: Option<&str>,
+) -> Vec<CtInfo> {
+    let mut targets: Vec<CtInfo> = cts
+        .iter()
+        .filter(|ct| owned(ct, gw_tag) && !ct.template)
+        .filter(|ct| {
+            let by_state = ws.is_some_and(|ws| {
+                ws.container_id.as_deref() == Some(ct.vmid.as_str()) || ct.name == ws.container_name
+            });
+            by_state || ct.has_tag(ws_tag)
+        })
+        .cloned()
+        .collect();
+    targets.sort_by_key(CtInfo::vmid_num);
+    targets.dedup_by(|a, b| a.vmid == b.vmid);
+    targets
+}
+
+fn from_tag(template_vmid: &str) -> String {
+    format!("{FROM_TAG_PREFIX}{template_vmid}")
+}
+
+/// Tags that must survive retagging a container (when it joins the pool or a workspace).
+fn carried_tags(ct: &CtInfo) -> Vec<String> {
+    ct.tags
+        .iter()
+        .filter(|t| t.starts_with(FROM_TAG_PREFIX))
+        .cloned()
+        .collect()
+}
+
+/// Why an owned template-tagged container may be removed.
+#[derive(Debug, PartialEq, Eq)]
+enum TemplateRemoval {
+    /// The gateway died while building it.
+    HalfBuilt,
+    /// A finished template for an old spec (or with linked clones off): remove once no clone uses it.
+    IfUnused,
+}
+
+fn template_removal(ct: &CtInfo, spec: &str, enabled: bool) -> Option<TemplateRemoval> {
+    if unfinished(ct) && is_named(&ct.name, TEMPLATE_HOSTNAME) {
+        Some(TemplateRemoval::HalfBuilt)
+    } else if ct.template && (!enabled || !ct.has_tag(spec)) {
+        Some(TemplateRemoval::IfUnused)
+    } else {
+        None
+    }
+}
+
+/// Whether a container cloned from template `vmid` still exists (by its source tag).
+fn has_tagged_clone(vmid: &str, cts: &[CtInfo]) -> bool {
+    cts.iter().any(|c| c.has_tag(&from_tag(vmid)))
+}
+
+/// Whether a container config's volumes sit on template `vmid`'s base volume.
+fn config_uses_base(conf: &Value, vmid: &str) -> bool {
+    let base = format!("base-{vmid}-");
+    conf.as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(k, _)| *k == "rootfs" || k.starts_with("mp") || k.starts_with("unused"))
+        .filter_map(|(_, v)| v.as_str())
+        .any(|v| v.contains(&base))
 }
 
 fn spec_tag(digest: &[u8]) -> String {
@@ -464,6 +597,8 @@ struct CtInfo {
     cpus: Option<f64>,
     mem: Option<u64>,
     maxmem: Option<u64>,
+    /// Config lock (`create`, `disk`, `clone`, ...), left behind when a `pct` operation dies.
+    lock: Option<String>,
 }
 
 impl CtInfo {
@@ -489,6 +624,11 @@ impl CtInfo {
             cpus: v.get("cpus").and_then(|c| c.as_f64().or_else(|| value_u64(c).map(|n| n as f64))),
             mem: v.get("mem").and_then(value_u64),
             maxmem: v.get("maxmem").and_then(value_u64),
+            lock: v
+                .get("lock")
+                .and_then(Value::as_str)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string),
         })
     }
 
@@ -526,6 +666,8 @@ pub struct ProxmoxManager {
     pool_lock: tokio::sync::Mutex<()>,
     /// Wakes the pool loop to refill.
     pool_notify: Notify,
+    /// This instance's `agentman-gw-*` tag (None for the default instance).
+    gw_tag: Option<String>,
 }
 
 impl ProxmoxManager {
@@ -558,6 +700,11 @@ impl ProxmoxManager {
             );
         }
 
+        let gw_tag = gateway_tag(&pcfg.instance_id)?;
+        if let Some(ref tag) = gw_tag {
+            info!("Gateway instance tag: {} (only containers with it are managed)", tag);
+        }
+
         let inner_docker = inner_docker_enabled(config.docker_in_sandbox.mode, pcfg);
         if inner_docker && !(pcfg.nesting && (pcfg.keyctl || !pcfg.unprivileged)) {
             warn!("Docker inside sandboxes is on, but proxmox.nesting/keyctl are off; dockerd will likely fail");
@@ -567,7 +714,7 @@ impl ProxmoxManager {
             if inner_docker { "on (LXC nesting)" } else { "off" }
         );
 
-        Ok(Self {
+        let manager = Self {
             api,
             node,
             config,
@@ -580,11 +727,75 @@ impl ProxmoxManager {
             clones_disabled: AtomicBool::new(false),
             pool_lock: tokio::sync::Mutex::new(()),
             pool_notify: Notify::new(),
-        })
+            gw_tag,
+        };
+        if let Err(e) = manager.prime().await {
+            warn!("Failed to look up the template and warm containers at startup: {:#}", e);
+        }
+        Ok(manager)
+    }
+
+    /// Before the first connection: clear locks a killed gateway left on its own template and
+    /// unfinished containers, and pick up an existing template so the first new project is
+    /// cloned instead of waiting for the pool loop. Nothing else runs in this process yet, so
+    /// no lock can belong to an operation still in progress.
+    async fn prime(&self) -> Result<()> {
+        let specs = self.compute_specs().await?;
+        *self.specs.write().await = Some(specs.clone());
+
+        let cts = self.list_cts().await?;
+        for ct in cts.iter().filter(|c| self.owns(c) && c.lock.is_some()) {
+            if stale_lock(ct) {
+                warn!(
+                    "Clearing stale '{}' lock on container {} ({})",
+                    ct.lock.as_deref().unwrap_or(""),
+                    ct.vmid,
+                    ct.name
+                );
+                if let Err(e) = self.run_tool(&self.pcfg().pct_path, &["unlock", &ct.vmid]).await {
+                    warn!("Failed to unlock container {}: {:#}", ct.vmid, e);
+                }
+            }
+        }
+
+        if self.pcfg().linked_clones {
+            if let Some(t) = cts
+                .iter()
+                .filter(|c| c.template && self.owns(c) && c.has_tag(TEMPLATE_TAG) && c.has_tag(&specs.template))
+                .min_by_key(|c| c.vmid_num())
+            {
+                info!("Cloning new sandboxes from template container {}", t.vmid);
+                *self.template.lock().await = Some((specs.template.clone(), t.vmid.clone()));
+            }
+        }
+        Ok(())
     }
 
     fn pcfg(&self) -> &ProxmoxConfig {
         &self.config.proxmox
+    }
+
+    /// The tags of container `vmid` that retagging must keep (see [`carried_tags`]).
+    async fn carried_tags(&self, vmid: &str) -> Result<Vec<String>> {
+        Ok(self
+            .find_ct(vmid)
+            .await?
+            .map(|ct| carried_tags(&ct))
+            .unwrap_or_default())
+    }
+
+    fn owns(&self, ct: &CtInfo) -> bool {
+        owned(ct, self.gw_tag.as_deref())
+    }
+
+    /// Tags every container of this instance starts with, followed by `extra` (`;`-separated).
+    fn tags_with(&self, extra: &[&str]) -> String {
+        let mut tags = vec![AGENTMAN_TAG];
+        if let Some(ref gw) = self.gw_tag {
+            tags.push(gw.as_str());
+        }
+        tags.extend(extra.iter().copied());
+        tags.join(";")
     }
 
     fn lxc_tool(&self, name: &str) -> PathBuf {
@@ -698,7 +909,44 @@ impl ProxmoxManager {
             );
         }
 
+        // The state file can lose a workspace (restored or edited by hand) while its container
+        // lives on; reuse that container instead of creating a second one.
+        if let Some(ct) = self.find_tagged_ct(github_user, project).await? {
+            warn!(
+                "Reusing untracked container {} ({}) for {}/{}",
+                ct.vmid, ct.name, github_user, project
+            );
+            self.ensure_running(&ct, project, progress).await?;
+            self.state
+                .set_workspace(WorkspaceInfo {
+                    github_user: github_user.to_string(),
+                    project: project.to_string(),
+                    runtime: RuntimeKind::Proxmox,
+                    container_name: ct.name.clone(),
+                    container_id: Some(ct.vmid.clone()),
+                    created_at: Utc::now(),
+                    host_workspace_path: workspace_path,
+                })
+                .await?;
+            if ct.has_tag(INNER_DOCKER_TAG) {
+                self.ensure_inner_dockerd(&ct.vmid).await;
+            }
+            self.remember_env(&ct.vmid, github_user, project, &ct.name).await;
+            return Ok(ct.vmid);
+        }
+
         self.create_container(github_user, project, progress).await
+    }
+
+    /// The newest managed container tagged with this workspace, if any.
+    async fn find_tagged_ct(&self, github_user: &str, project: &str) -> Result<Option<CtInfo>> {
+        let tag = workspace_tag(github_user, project);
+        Ok(self
+            .list_cts()
+            .await?
+            .into_iter()
+            .filter(|c| self.owns(c) && !c.template && c.has_tag(&tag))
+            .max_by_key(CtInfo::vmid_num))
     }
 
     /// Record the container's environment: the image's ENV (written into the template by
@@ -924,11 +1172,14 @@ impl ProxmoxManager {
     ) -> Result<()> {
         let description = format!("Managed by agentman for {github_user}/{project}");
         let mp0 = format!("{},mp={}", workspace_path.display(), WORKSPACE_MOUNT);
-        let tags = if self.inner_docker {
-            format!("{AGENTMAN_TAG};{INNER_DOCKER_TAG}")
-        } else {
-            AGENTMAN_TAG.to_string()
-        };
+        let ws_tag = workspace_tag(github_user, project);
+        let carried = self.carried_tags(vmid).await?;
+        let mut extra: Vec<&str> = carried.iter().map(String::as_str).collect();
+        if self.inner_docker {
+            extra.push(INNER_DOCKER_TAG);
+        }
+        extra.push(&ws_tag);
+        let tags = self.tags_with(&extra);
         let mut pct_args = vec![
             "set",
             vmid,
@@ -1050,7 +1301,8 @@ impl ProxmoxManager {
             .into_iter()
             .map(|(k, v)| (format!("--{k}"), v))
             .collect();
-        let mut args = vec!["set", vmid.as_str(), "--tags", AGENTMAN_TAG];
+        let tags = self.tags_with(&[&from_tag(template)]);
+        let mut args = vec!["set", vmid.as_str(), "--tags", tags.as_str()];
         for (k, v) in &opts {
             args.extend([k.as_str(), v.as_str()]);
         }
@@ -1146,22 +1398,18 @@ impl ProxmoxManager {
         let mut cached = self.template.lock().await;
         let enabled = self.pcfg().linked_clones && !self.clones_disabled.load(Ordering::Relaxed);
 
-        for ct in cts.iter().filter(|c| c.is_managed() && c.has_tag(TEMPLATE_TAG)) {
-            let half_built = !ct.template && is_named(&ct.name, TEMPLATE_HOSTNAME);
-            let stale = ct.template && (!enabled || !ct.has_tag(&specs.template));
-            if half_built {
-                warn!("Removing unfinished template container {}", ct.vmid);
-            } else if stale {
-                match self.template_in_use(&ct.vmid, cts).await {
+        for ct in cts.iter().filter(|c| self.owns(c) && c.has_tag(TEMPLATE_TAG)) {
+            match template_removal(ct, &specs.template, enabled) {
+                Some(TemplateRemoval::HalfBuilt) => warn!("Removing unfinished template container {}", ct.vmid),
+                Some(TemplateRemoval::IfUnused) => match self.template_in_use(&ct.vmid, cts).await {
                     Ok(false) => info!("Removing old template container {}", ct.vmid),
                     Ok(true) => continue,
                     Err(e) => {
                         debug!("Cannot tell whether template {} is in use: {:#}", ct.vmid, e);
                         continue;
                     }
-                }
-            } else {
-                continue;
+                },
+                None => continue,
             }
             if let Err(e) = self.delete_ct(&ct.vmid).await {
                 warn!("Failed to remove container {}: {:#}", ct.vmid, e);
@@ -1174,7 +1422,7 @@ impl ProxmoxManager {
         }
         if let Some(t) = cts
             .iter()
-            .filter(|c| c.template && c.is_managed() && c.has_tag(TEMPLATE_TAG) && c.has_tag(&specs.template))
+            .filter(|c| c.template && self.owns(c) && c.has_tag(TEMPLATE_TAG) && c.has_tag(&specs.template))
             .min_by_key(|c| c.vmid_num())
         {
             *cached = Some((specs.template.clone(), t.vmid.clone()));
@@ -1201,17 +1449,13 @@ impl ProxmoxManager {
 
     /// Whether any container's root filesystem is a linked clone of template `vmid`.
     async fn template_in_use(&self, vmid: &str, cts: &[CtInfo]) -> Result<bool> {
-        let base = format!("base-{vmid}-");
+        if has_tagged_clone(vmid, cts) {
+            return Ok(true);
+        }
+        // Clones from before the source tag: some storage names the base volume in the config.
         for ct in cts.iter().filter(|c| c.vmid != vmid) {
             let conf = self.api.get(&self.ct_path(&ct.vmid, "/config")).await?;
-            let uses = conf
-                .as_object()
-                .into_iter()
-                .flatten()
-                .filter(|(k, _)| *k == "rootfs" || k.starts_with("mp") || k.starts_with("unused"))
-                .filter_map(|(_, v)| v.as_str())
-                .any(|v| v.contains(&base));
-            if uses {
+            if config_uses_base(&conf, vmid) {
                 return Ok(true);
             }
         }
@@ -1226,7 +1470,7 @@ impl ProxmoxManager {
             .create_from_ostemplate(&hostname, "agentman template: sandboxes are linked clones of it")
             .await?;
         let pct = &self.pcfg().pct_path;
-        let tags = format!("{AGENTMAN_TAG};{TEMPLATE_TAG};{spec}");
+        let tags = self.tags_with(&[TEMPLATE_TAG, spec]);
         let res = async {
             self.run_tool(pct, &["set", &vmid, "--tags", &tags]).await?;
             self.run_tool(pct, &["template", &vmid]).await
@@ -1242,8 +1486,8 @@ impl ProxmoxManager {
         Ok(vmid)
     }
 
-    fn is_pool_member(ct: &CtInfo, specs: &Specs) -> bool {
-        ct.is_managed()
+    fn is_pool_member(ct: &CtInfo, specs: &Specs, gw_tag: Option<&str>) -> bool {
+        owned(ct, gw_tag)
             && ct.has_tag(POOL_TAG)
             && ct.has_tag(&specs.pool)
             && !ct.template
@@ -1265,7 +1509,7 @@ impl ProxmoxManager {
         let specs = self.specs.read().await.clone()?;
         let _pool = self.pool_lock.lock().await;
         let mut members: Vec<CtInfo> = match self.list_cts().await {
-            Ok(cts) => cts.into_iter().filter(|c| Self::is_pool_member(c, &specs)).collect(),
+            Ok(cts) => cts.into_iter().filter(|c| Self::is_pool_member(c, &specs, self.gw_tag.as_deref())).collect(),
             Err(e) => {
                 warn!("Failed to list warm containers: {:#}", e);
                 return None;
@@ -1331,7 +1575,7 @@ impl ProxmoxManager {
             let mut fresh = 0;
             let mut members: Vec<&CtInfo> = cts
                 .iter()
-                .filter(|c| c.is_managed() && c.has_tag(POOL_TAG) && !c.template)
+                .filter(|c| self.owns(c) && c.has_tag(POOL_TAG) && !c.template)
                 .collect();
             members.sort_by_key(|c| c.vmid_num());
             for ct in members {
@@ -1355,11 +1599,11 @@ impl ProxmoxManager {
                     warn!("Failed to remove container {}: {:#}", ct.vmid, e);
                 }
             }
-            // Clones that never got their pool tag (the gateway stopped mid-way) still carry
-            // the template's tags.
-            for ct in cts.iter().filter(|c| {
-                c.is_managed() && c.has_tag(TEMPLATE_TAG) && !c.template && is_named(&c.name, POOL_HOSTNAME)
-            }) {
+            // Warm containers the gateway stopped building half-way (killed mid clone or tag).
+            for ct in cts
+                .iter()
+                .filter(|c| self.owns(c) && unfinished(c) && is_named(&c.name, POOL_HOSTNAME))
+            {
                 warn!("Removing unfinished warm container {}", ct.vmid);
                 if let Err(e) = self.delete_ct(&ct.vmid).await {
                     warn!("Failed to remove container {}: {:#}", ct.vmid, e);
@@ -1375,7 +1619,7 @@ impl ProxmoxManager {
                 .list_cts()
                 .await?
                 .iter()
-                .filter(|c| Self::is_pool_member(c, &specs))
+                .filter(|c| Self::is_pool_member(c, &specs, self.gw_tag.as_deref()))
                 .count();
             if count >= want {
                 return Ok(());
@@ -1389,7 +1633,19 @@ impl ProxmoxManager {
         let vmid = self
             .provision_blank(&hostname, "agentman warm pool: ready for the next new project")
             .await?;
-        let tags = format!("{AGENTMAN_TAG};{POOL_TAG};{}", specs.pool);
+        let tags = match self.carried_tags(&vmid).await {
+            Ok(carried) => {
+                let mut extra: Vec<&str> = carried.iter().map(String::as_str).collect();
+                extra.extend([POOL_TAG, specs.pool.as_str()]);
+                self.tags_with(&extra)
+            }
+            Err(e) => {
+                if let Err(e2) = self.delete_ct(&vmid).await {
+                    warn!("Cleanup of container {} failed: {:#}", vmid, e2);
+                }
+                return Err(e);
+            }
+        };
         if let Err(e) = self
             .run_tool(&self.pcfg().pct_path, &["set", &vmid, "--tags", &tags])
             .await
@@ -1622,26 +1878,29 @@ impl ProxmoxManager {
 
         let cts = self.list_cts().await.context("Failed to list containers")?;
 
-        // Targets: the state-mapped VMID, plus any agentman-tagged container with the same hostname.
-        let mut targets: Vec<CtInfo> = Vec::new();
-        if let Some(ws) = self.state.get_workspace(github_user, project).await {
-            if ws.runtime != RuntimeKind::Proxmox {
+        let ws = self.state.get_workspace(github_user, project).await;
+        let ws = match ws {
+            Some(ws) if ws.runtime != RuntimeKind::Proxmox => {
                 warnings.push(format!(
                     "workspace belongs to the {} runtime; its container was not removed",
                     ws.runtime
                 ));
-            } else {
-                for ct in &cts {
-                    let by_id = ws.container_id.as_deref() == Some(ct.vmid.as_str());
-                    let by_name = ct.is_managed() && ct.name == ws.container_name;
-                    if by_id || by_name {
-                        targets.push(ct.clone());
-                    }
-                }
+                None
             }
+            ws => ws,
+        };
+        if ws.is_none() {
+            info!(
+                "No Proxmox state entry for {}/{}; looking for its container by tag",
+                github_user, project
+            );
         }
-        targets.sort_by(|a, b| a.vmid.cmp(&b.vmid));
-        targets.dedup_by(|a, b| a.vmid == b.vmid);
+        let targets = destroy_targets(
+            &cts,
+            ws.as_ref(),
+            &workspace_tag(github_user, project),
+            self.gw_tag.as_deref(),
+        );
 
         let mut removed_containers = Vec::new();
         for ct in targets {
@@ -1741,15 +2000,186 @@ mod tests {
             .unwrap()
         };
         let fresh = "agentman;agentman-pool;agentman-spec-bbbbbbbbbbbb";
-        assert!(ProxmoxManager::is_pool_member(&ct(fresh, "stopped", 0), &specs));
-        assert!(!ProxmoxManager::is_pool_member(&ct(fresh, "running", 0), &specs));
-        assert!(!ProxmoxManager::is_pool_member(&ct(fresh, "stopped", 1), &specs));
+        assert!(ProxmoxManager::is_pool_member(&ct(fresh, "stopped", 0), &specs, None));
+        assert!(!ProxmoxManager::is_pool_member(&ct(fresh, "running", 0), &specs, None));
+        assert!(!ProxmoxManager::is_pool_member(&ct(fresh, "stopped", 1), &specs, None));
         assert!(!ProxmoxManager::is_pool_member(
             &ct("agentman;agentman-pool;agentman-spec-cccccccccccc", "stopped", 0),
-            &specs
+            &specs,
+            None
         ));
         // A workspace container (claimed: no pool tag) is never taken again.
-        assert!(!ProxmoxManager::is_pool_member(&ct("agentman;agentman-dind", "stopped", 0), &specs));
+        assert!(!ProxmoxManager::is_pool_member(&ct("agentman;agentman-dind", "stopped", 0), &specs, None));
+    }
+
+    #[test]
+    fn destroy_finds_tagged_container_without_state() {
+        let ws_tag = workspace_tag("agentman-livecheck", "upgradecheck");
+        assert!(ws_tag.starts_with("agentman-ws-") && ws_tag.len() == "agentman-ws-".len() + 12);
+        assert_ne!(ws_tag, workspace_tag("agentman-livecheck", "other"));
+        let ct = |vmid: u32, name: &str, tags: String, template: u8| {
+            CtInfo::from_value(&serde_json::json!({
+                "vmid": vmid, "name": name, "status": "running", "tags": tags, "template": template
+            }))
+            .unwrap()
+        };
+        let cts = vec![
+            ct(115, "upgradecheck-agentman-livecheck-20261014", format!("agentman;agentman-dind;{ws_tag}"), 0),
+            ct(111, "proj-theykk-20261014", "agentman;agentman-dind".to_string(), 0),
+            ct(120, "agentman-pool", "agentman;agentman-pool".to_string(), 0),
+            // Same tag but not managed by agentman: never touched.
+            ct(130, "mine", ws_tag.clone(), 0),
+        ];
+
+        // No state entry (lost or never written): found by tag only.
+        let ids: Vec<String> = destroy_targets(&cts, None, &ws_tag, None).into_iter().map(|c| c.vmid).collect();
+        assert_eq!(ids, ["115"]);
+
+        // A state entry still finds its container by id or hostname (containers from before tags).
+        let ws = WorkspaceInfo {
+            github_user: "theykk".to_string(),
+            project: "proj".to_string(),
+            runtime: RuntimeKind::Proxmox,
+            container_name: "proj-theykk-20261014".to_string(),
+            container_id: Some("111".to_string()),
+            created_at: Utc::now(),
+            host_workspace_path: PathBuf::from("/tmp/x"),
+        };
+        let ids: Vec<String> = destroy_targets(&cts, Some(&ws), &workspace_tag("theykk", "proj"), None)
+            .into_iter()
+            .map(|c| c.vmid)
+            .collect();
+        assert_eq!(ids, ["111"]);
+    }
+
+    #[test]
+    fn gateway_instances_only_touch_their_own_containers() {
+        assert_eq!(gateway_tag("").unwrap(), None);
+        assert_eq!(gateway_tag("test-1").unwrap().as_deref(), Some("agentman-gw-test-1"));
+        assert!(gateway_tag("Test").is_err());
+        assert!(gateway_tag("a;b").is_err());
+
+        let specs = Specs {
+            template: "agentman-spec-aaaaaaaaaaaa".to_string(),
+            pool: "agentman-spec-bbbbbbbbbbbb".to_string(),
+        };
+        let ct = |vmid: u32, tags: &str| {
+            CtInfo::from_value(&serde_json::json!({
+                "vmid": vmid, "name": "agentman-pool", "status": "stopped", "tags": tags, "template": 0
+            }))
+            .unwrap()
+        };
+        // A warm container from before instance ids (no gateway tag): the default instance's.
+        let legacy = ct(116, "agentman;agentman-pool;agentman-spec-bbbbbbbbbbbb");
+        let test = ct(120, "agentman;agentman-gw-test;agentman-pool;agentman-spec-bbbbbbbbbbbb");
+        let gw = Some("agentman-gw-test");
+        assert!(ProxmoxManager::is_pool_member(&legacy, &specs, None));
+        assert!(!ProxmoxManager::is_pool_member(&legacy, &specs, gw));
+        assert!(ProxmoxManager::is_pool_member(&test, &specs, gw));
+        assert!(!ProxmoxManager::is_pool_member(&test, &specs, None));
+        assert!(!owned(&ct(121, "agentman;agentman-gw-other"), gw));
+
+        // Destroy never crosses instances, even for the same user/project or a matching VMID.
+        let ws_tag = workspace_tag("u", "p");
+        let cts = vec![
+            ct(130, &format!("agentman;{ws_tag}")),
+            ct(131, &format!("agentman;agentman-gw-test;{ws_tag}")),
+        ];
+        let ids = |gw: Option<&str>| -> Vec<String> {
+            destroy_targets(&cts, None, &ws_tag, gw).into_iter().map(|c| c.vmid).collect()
+        };
+        assert_eq!(ids(None), ["130"]);
+        assert_eq!(ids(gw), ["131"]);
+        let ws = WorkspaceInfo {
+            github_user: "u".to_string(),
+            project: "p".to_string(),
+            runtime: RuntimeKind::Proxmox,
+            container_name: "x".to_string(),
+            container_id: Some("130".to_string()),
+            created_at: Utc::now(),
+            host_workspace_path: PathBuf::from("/tmp/x"),
+        };
+        let by_id: Vec<String> = destroy_targets(&cts, Some(&ws), "agentman-ws-none", gw)
+            .into_iter()
+            .map(|c| c.vmid)
+            .collect();
+        assert!(by_id.is_empty());
+    }
+
+    #[test]
+    fn only_leftover_locks_are_cleared() {
+        let ct = |name: &str, tags: &str, template: u8, lock: &str| {
+            CtInfo::from_value(&serde_json::json!({
+                "vmid": 120, "name": name, "status": "stopped", "tags": tags,
+                "template": template, "lock": lock
+            }))
+            .unwrap()
+        };
+        let tmpl = "agentman;agentman-template;agentman-spec-aaaaaaaaaaaa";
+        // Template locked by a clone that died, and the half-made clone (still template-tagged).
+        assert!(stale_lock(&ct("agentman-template", tmpl, 1, "disk")));
+        assert!(stale_lock(&ct("agentman-pool-2", tmpl, 0, "create")));
+        assert!(stale_lock(&ct("agentman-template", tmpl, 0, "create")));
+        // Killed after the clone's tags were reset but before the pool tag was added.
+        assert!(stale_lock(&ct("agentman-pool-1", "agentman;agentman-gw-test", 0, "create")));
+        assert!(unfinished(&ct("agentman-pool-1", "agentman;agentman-gw-test", 0, "")));
+        // Finished warm containers, claimed sandboxes and templates are not unfinished.
+        assert!(!unfinished(&ct("agentman-pool-1", "agentman;agentman-pool;agentman-spec-b", 0, "")));
+        assert!(!unfinished(&ct("agentman-pool", "agentman;agentman-ws-0123456789ab", 0, "")));
+        assert!(!unfinished(&ct("agentman-template", tmpl, 1, "")));
+        // Not locked, or a workspace sandbox (even one still carrying template tags).
+        assert!(!stale_lock(&ct("agentman-template", tmpl, 1, "")));
+        assert!(!stale_lock(&ct("proj-user-20261014", tmpl, 0, "create")));
+        assert!(!stale_lock(&ct("proj-user-20261014", "agentman", 0, "backup")));
+    }
+
+    #[test]
+    fn clone_source_tag_survives_retagging() {
+        let ct = CtInfo::from_value(&serde_json::json!({
+            "vmid": 117, "name": "agentman-pool", "status": "stopped",
+            "tags": "agentman;agentman-from-115;agentman-gw-test", "template": 0
+        }))
+        .unwrap();
+        assert!(ct.has_tag(&from_tag("115")));
+        assert_eq!(carried_tags(&ct), ["agentman-from-115"]);
+        // A clone that is retagged but not yet in the pool still counts as unfinished.
+        assert!(unfinished(&ct));
+    }
+
+    #[test]
+    fn old_template_is_removed_only_after_its_clones() {
+        let ct = |vmid: u32, name: &str, tags: &str, template: u8| {
+            CtInfo::from_value(&serde_json::json!({
+                "vmid": vmid, "name": name, "status": "stopped", "tags": tags, "template": template
+            }))
+            .unwrap()
+        };
+        let old = ct(115, "agentman-template", "agentman;agentman-template;agentman-spec-aaaaaaaaaaaa", 1);
+        let current = ct(118, "agentman-template-1", "agentman;agentman-template;agentman-spec-bbbbbbbbbbbb", 1);
+        let warm = ct(116, "agentman-pool", "agentman;agentman-from-115;agentman-pool;agentman-spec-a", 0);
+        let claimed = ct(117, "proj-user-20261014", "agentman;agentman-from-115;agentman-ws-0123456789ab", 0);
+        let spec = "agentman-spec-bbbbbbbbbbbb";
+
+        // A spec change makes the old template removable once unused; the current one stays.
+        assert_eq!(template_removal(&old, spec, true), Some(TemplateRemoval::IfUnused));
+        assert_eq!(template_removal(&current, spec, true), None);
+        assert_eq!(template_removal(&current, spec, false), Some(TemplateRemoval::IfUnused));
+
+        // Kept while a warm or claimed clone exists, removable after both are destroyed.
+        let mut cts = vec![old, current, warm, claimed];
+        assert!(has_tagged_clone("115", &cts));
+        cts.retain(|c| c.vmid != "116");
+        assert!(has_tagged_clone("115", &cts));
+        cts.retain(|c| c.vmid != "117");
+        assert!(!has_tagged_clone("115", &cts));
+        assert!(!has_tagged_clone("118", &cts));
+
+        // Clones from before the source tag are found by their base volume.
+        let linked = serde_json::json!({"rootfs": "local:115/base-115-disk-0.raw/117/vm-117-disk-0.raw,size=8G"});
+        let full = serde_json::json!({"rootfs": "local-lvm:vm-117-disk-0,size=8G", "mp0": "/srv/ws,mp=/workspace"});
+        assert!(config_uses_base(&linked, "115"));
+        assert!(!config_uses_base(&linked, "11"));
+        assert!(!config_uses_base(&full, "115"));
     }
 
     #[test]

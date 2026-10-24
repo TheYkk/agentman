@@ -283,6 +283,8 @@ Setup:
 
 Both run as root through `pct`, so the API token needs no extra privileges. Only containers carrying these agentman tags are ever removed by this housekeeping.
 
+**Several gateways on one node.** Each sandbox is tagged with its workspace (`agentman-ws-<hash>`), so `agentman destroy` and reconnects find it even without a state file entry. To run a second gateway against the same pool (e.g. a test instance next to a permanent one), give it its own `instance_id` in `[proxmox]`: its containers get an `agentman-gw-<instance_id>` tag and it only ever claims, reuses, cleans up or destroys containers with that tag. A gateway with no `instance_id` owns the containers with no `agentman-gw-*` tag, which includes everything created before the option existed, so an existing install needs no migration.
+
 Limitations: `ssh -R` listeners bind on the Proxmox host, and there is no `host.docker.internal` alias inside LXC containers. Docker's capability/seccomp settings in `[container_security]` do not apply; LXC containers use Proxmox's AppArmor profile and user namespaces instead. Workspaces created under one runtime are not reused by the other; switching runtimes provisions a fresh container on the same workspace directory.
 
 ### Docker Inside Sandboxes
