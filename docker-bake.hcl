@@ -8,7 +8,7 @@ variable "IMAGE_TAG"     { default = "dev" }
 variable "PLATFORMS"     { default = "linux/amd64" }
 
 variable "DEBIAN_TAG"    { default = "trixie-slim" }
-variable "MISE_VERSION"     { default = "2026.11.1" }
+variable "MISE_VERSION"     { default = "2026.11.2" }
 variable "HERDR_VERSION"    { default = "0.9.5" }
 variable "RUSTUP_VERSION"   { default = "1.29.3" }
 variable "RUST_TOOLCHAIN"   { default = "1.99.1" }
@@ -26,7 +26,7 @@ variable "PI_VERSION"       { default = "1.5.0" }
 variable "OMP_VERSION"      { default = "18.16.0" }
 variable "CLOUDFLARED_VERSION" { default = "2026.10.7" }
 variable "GH_VERSION"       { default = "2.103.3" }
-variable "CADDY_VERSION"    { default = "2.11.8" }
+variable "CADDY_VERSION"    { default = "2.11.9" }
 variable "EZA_VERSION"      { default = "0.23.5" }
 variable "BAT_VERSION"      { default = "0.26.1" }
 
